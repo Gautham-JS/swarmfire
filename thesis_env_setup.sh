@@ -24,4 +24,7 @@ printf "\n\n[INFO] : INSTALLING 'transformers' from git\n"
 pip install git+https://github.com/huggingface/transformers.git
 
 
+printf "\n\n[INFO] : INSTALLING 'gymnasium'\n"
+pip install gymnasium
+
 printf "\n\n[INFO] : KERNEL 'thesis' READY FOR USE\n"

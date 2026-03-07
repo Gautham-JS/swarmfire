@@ -20,9 +20,9 @@ controller = DroneController(p=0.6)
 
 
 N = 30
-min_lim = -200
-max_lim = 200
-clear = False
+min_lim = 0
+max_lim = 400
+clear = True
 
 
 
