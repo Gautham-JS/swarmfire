@@ -37,7 +37,6 @@ for p in bez_path:
     percieved_scene_np = (percieved_scene * 255).astype(np.uint8)
 
     scene_bgr = np.stack([percieved_scene_np, percieved_scene_np, percieved_scene_np], axis=-1)
-    #cv2.cvtColor(scene_bgr, cv2.COLOR_GRAY2BGR)
     cv2.drawMarker(scene_bgr, (p[1], p[0]), color=(0, 255, 0), markerType=cv2.MARKER_CROSS, thickness=2)
     cv2.imshow("window", (view * 255).astype(np.uint8))
     cv2.imshow("Perception Accumulator", scene_bgr)
