@@ -115,7 +115,7 @@ class SwarmUpdater:
             cv2.putText(lfm, agent_id, (pos[1] - 20, pos[0]-20), fontFace=cv2.FONT_HERSHEY_SIMPLEX, color=(0, 255, 0), fontScale=0.5)
             if idx > 1:
                 hist = np.array(hist_pos, dtype=np.int32)[:, ::-1].reshape((-1, 1, 2))
-                cv2.polylines(lfm, [hist], isClosed=False, color=(0, 255, 255), thickness=2)
+                cv2.polylines(lfm, [hist], isClosed=False, color=(255, 255, 0), thickness=2)
         return lfm
 
     def update_fn(self):
@@ -187,7 +187,7 @@ updater = LocalUpdater(size)
 updater.set_points(bez_path)
 
 
-N = 5
+N = 10
 point_list = point_gen.random_3d_point_sets(N, 5, (0, size[0]), (0, size[1]), (0, 0))
 point_list_2d = point_list[:, :, :2]
 

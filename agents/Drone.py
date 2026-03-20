@@ -63,6 +63,11 @@ class Drone:
         self.pos["y"] += self.vel["y"]
         self.pos["z"] += self.vel["z"]
         return
+    
+    def inject_velocity(self, velocity:dict):
+        self.set_velocity(velocity)
+        self.step()
+        return self.get_position()
 
 
 def inject_input(agent:Drone, velocity:dict):

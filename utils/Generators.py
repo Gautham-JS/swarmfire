@@ -127,14 +127,14 @@ class FuelMapGenerator:
 
         return mask.astype(np.uint8)
     
-    def create_mask(self, canopy_density_alive, canopy_density_dead, canopy_size_mean=8, merge_radius=3):
+    def create_mask(self, canopy_density_alive, canopy_density_dead, canopy_size_mean=8, merge_radius=3, seed=None):
         tree_mask_base = self.generate_tree_mask_fastest(
             self.size,
             canopy_density=canopy_density_alive,
             canopy_size_mean=8,
             merge_radius=3,      
             edge_noise_scale=2,
-            seed=10
+            seed=seed
         )
 
 
