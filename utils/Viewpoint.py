@@ -128,22 +128,23 @@ def get_square_viewpoint_and_mark_visited(array: np.ndarray, visited: np.ndarray
     viewpoint[dst_row_start:dst_row_end, dst_col_start:dst_col_end] = \
         array[src_row_start:src_row_end, src_col_start:src_col_end]
     
-    old_visited_mask = visited[src_row_start:src_row_end, src_col_start:src_col_end]
+    old_visited_mask = np.zeros((size, size), dtype=np.bool)
+    old_visited_mask[dst_row_start:dst_row_end, dst_col_start:dst_col_end] = visited[src_row_start:src_row_end, src_col_start:src_col_end] > 0
+    delta_mask = np.logical_not(old_visited_mask).copy()
 
     visited[src_row_start:src_row_end, src_col_start:src_col_end] = True
 
-    delta_mask = np.logical_not(old_visited_mask)
     return viewpoint, visited, delta_mask
 
 
 class IncrementalViewAccumulator:
-    def __init__(self, size):
+    def __init__(self, size, n_channels):
         self.size = size
-        self.scene = np.zeros(size, dtype=np.float32)
-        self.visited = np.zeros(size, dtype=bool)
+        self.scene = np.zeros((size[0], size[1], n_channels), dtype=np.float32)
+        self.visited = np.zeros((size[0], size[1]), dtype=bool)
 
     def accumulate(self, view: np.ndarray, center_position: tuple, view_size=32):
-        H, W = self.scene.shape
+        H, W = self.scene.shape[:2]
         row, col = center_position[:2]
         half = view_size // 2
 
@@ -159,7 +160,7 @@ class IncrementalViewAccumulator:
 
         visited_slice = self.visited[src_row_start:src_row_end, src_col_start:src_col_end]
 
-        self.scene[src_row_start:src_row_end, src_col_start:src_col_end] = view[dst_row_start:dst_row_end, dst_col_start:dst_col_end]
+        self.scene[src_row_start:src_row_end, src_col_start:src_col_end, :] = view[dst_row_start:dst_row_end, dst_col_start:dst_col_end, :]
         self.visited[src_row_start:src_row_end, src_col_start:src_col_end] = True
 
         transformed_bounds = ((src_row_start, src_col_start), (src_row_end, src_col_end))
@@ -167,7 +168,7 @@ class IncrementalViewAccumulator:
         return self.get_scene(), transformed_bounds
 
     def get_scene(self):
-        return np.where(self.visited, self.scene, 0.0)
+        return np.where(self.visited[:, :, np.newaxis], self.scene, 0.0)
 
     def reset(self):
         self.scene[:] = 0.0

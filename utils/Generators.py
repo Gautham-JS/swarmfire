@@ -62,9 +62,144 @@ class AgentGenerators:
         return agents
     
 
+
+
+
 class FuelMapGenerator:
     def __init__(self, size):
         self.size = size
+    
+    from scipy.ndimage import gaussian_filter
+    from skimage.morphology import dilation, disk
+
+
+    def generate_wind_field(self, shape, magnitude_mean=1.0, magnitude_std=0.3, seed=None):
+        if seed is not None:
+            np.random.seed(seed)
+
+        H, W = shape
+
+        angle = np.random.uniform(0, 2*np.pi)
+        magnitude = max(0.1, np.random.normal(magnitude_mean, magnitude_std))
+
+        wx = magnitude * np.cos(angle)
+        wy = magnitude * np.sin(angle)
+
+        return wx, wy
+
+
+    def generate_fire_field_clustered(
+        self,
+        shape,
+        num_regions=3,
+        region_scale=150,
+        scale_min=30,
+        scale_max=120,
+        seed=None
+    ):
+        if seed is not None:
+            np.random.seed(seed)
+
+        H, W = shape
+
+        # region clustering
+        region_field = gaussian_filter(np.random.rand(H, W), sigma=region_scale)
+        region_field = (region_field - region_field.min()) / (region_field.max() - region_field.min())
+
+        thresholds = np.linspace(0.6, 0.9, num_regions)
+
+        field = np.zeros((H, W), dtype=np.float32)
+
+        for t in thresholds:
+            region = region_field > t
+
+            if not region.any():
+                continue
+
+            noise = np.random.randn(H, W).astype(np.float32)
+            sigma = np.random.uniform(scale_min, scale_max)
+
+            local = gaussian_filter(noise, sigma=sigma)
+            local = (local - local.min()) / (local.max() - local.min())
+
+            field += local * region
+
+        # normalize
+        field = (field - field.min()) / (field.max() - field.min())
+
+        return field
+
+
+    def generate_fire_perimeter_timeseries(
+            self,
+            shape,
+            timesteps=5,
+            fronts_per_step=2,
+            width_mean=3,
+            width_std=1,
+            growth_rate=0.02,
+            wind_strength=0.5,
+            edge_sigma=1.0,
+            seed=None
+        ):
+
+        if seed is not None:
+            np.random.seed(seed)
+
+        H, W = shape
+
+        # base field
+        field = self.generate_fire_field_clustered(shape, seed=seed)
+
+        # wind
+        wx, wy = self.generate_wind_field(shape, seed=seed)
+
+        # coordinate grid (for wind bias)
+        y, x = np.meshgrid(np.arange(H), np.arange(W), indexing='ij')
+
+        x_norm = (x - W/2) / W
+        y_norm = (y - H/2) / H
+
+        wind_bias = wx * x_norm + wy * y_norm
+
+        # store results
+        masks = []
+
+        # initial levels (fire fronts)
+        base_levels = np.random.uniform(0.3, 0.7, size=fronts_per_step)
+
+        for t in range(timesteps):
+
+            mask_lines = np.zeros((H, W), dtype=bool)
+
+            # time-dependent level shift (expansion)
+            time_shift = t * growth_rate
+
+            # wind pushes fire faster in direction
+            effective_field = field + wind_strength * wind_bias
+
+            for lvl in base_levels:
+
+                # expansion outward/inward
+                level = lvl + time_shift
+
+                band = np.abs(effective_field - level) < 0.01
+
+                # thickness
+                width = max(1, int(np.random.normal(width_mean, width_std)))
+                if width > 1:
+                    band = dilation(band, footprint=disk(width))
+
+                mask_lines |= band
+
+            # smooth edges slightly
+            if edge_sigma > 0:
+                smooth = gaussian_filter(mask_lines.astype(float), sigma=edge_sigma)
+                mask_lines = smooth > 0.3
+
+            masks.append(mask_lines.astype(np.uint8))
+
+        return masks, (wx, wy)
 
     def generate_tree_mask_fastest(
             self,
@@ -127,7 +262,7 @@ class FuelMapGenerator:
 
         return mask.astype(np.uint8)
     
-    def create_mask(self, canopy_density_alive, canopy_density_dead, canopy_size_mean=8, merge_radius=3, seed=None):
+    def create_map(self, canopy_density_alive, canopy_density_dead, canopy_size_mean=8, merge_radius=3, seed=None):
         tree_mask_base = self.generate_tree_mask_fastest(
             self.size,
             canopy_density=canopy_density_alive,
@@ -144,12 +279,21 @@ class FuelMapGenerator:
             canopy_size_mean=8,
             merge_radius=3,      
             edge_noise_scale=2,
-            seed=10
+            seed=seed
         )
+
+        world_map = np.zeros((self.size[0], self.size[0], 2), dtype=np.float32)
+
+        fire_masks, wind_vectors = self.generate_fire_perimeter_timeseries(self.size, 3, growth_rate=0.03, wind_strength=1.0)
+        fire_mask = fire_masks[0]
         
         w = 0.7
         forest_fuel_map = (w * tree_mask_base) + ((1-w) * tree_mask_dead)
-        return forest_fuel_map
+        world_map[:, :, 0] = forest_fuel_map
+        world_map[:, :, 1] = fire_mask
+
+
+        return world_map
     
 
 from scipy.special import comb
