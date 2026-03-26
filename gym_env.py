@@ -1,5 +1,7 @@
 import gymnasium as gym
 import numpy as np
+from scipy.spatial import cKDTree
+
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
 from matplotlib.gridspec import GridSpec
@@ -15,7 +17,7 @@ class MultiAgentEnv(gym.Env):
 
     metadata = {"render_modes": ["human", "rgb_array"], "render_fps": 30, "name": "multi_drone_v0"}
 
-    def __init__(self, n_agents, world_size, start_positions:list=None, iter_limit=100, seed = None, env_id="MultiAgentEnv", render_mode="human"):
+    def __init__(self, n_agents, world_size, start_positions:list=None, iter_limit=100, seed = None, env_id="MultiAgentEnv", render_mode="human", sample_interval=100):
         super().__init__()
 
         self.n_agents = n_agents
@@ -25,30 +27,49 @@ class MultiAgentEnv(gym.Env):
         self.render_mode = render_mode
         self.start_poss = start_positions
         self.env_id = env_id
+        self.sample_int = sample_interval
+
+        self._episode_count = 0
 
 
         self.vp_size = 64
-        self.step_size = 4
+        self.step_size = 10
 
         # sort of flattening the multi agent space into a 1D single agent space.
         # TODO : Encoder can make it input shape agnostic
         self.actions_per_agent = 2
         self.n_actions = self.n_agents * self.actions_per_agent
-        self.action_space = gym.spaces.Box(
-            low=0,
-            high=2,
-            shape=(self.n_agents * 2,),
-            dtype=np.uint8
-        )
+        # self.action_space = gym.spaces.Box(
+        #     low=0,
+        #     high=2,
+        #     shape=(self.n_agents * 2,),
+        #     dtype=np.uint8
+        # )
+
+        self.action_space = gym.spaces.MultiDiscrete([3] * (self.n_agents * 2))
+
 
         # once again, flattening the multi agent observations into a single world level observation.
         # TODO: Encoder should once again make it shape agnostic
-        self.observation_space = gym.spaces.Box(
-            low=0, 
-            high=255,
-            shape=(2, self.world_size[0], self.world_size[1]), 
-            dtype=np.uint8
-        )
+
+        # self.observation_space = gym.spaces.Dict({
+        #     "viewport": gym.spaces.Box(
+        #         low=0.0, high=1.0,
+        #         shape=(2, self.world_size[0], self.world_size[1]),  # CHW
+        #         dtype=np.float32
+        #     ),
+        #     "positions": gym.spaces.Box(
+        #         low=0,
+        #         high=max(self.world_size),
+        #         shape=(self.n_agents * 2,),
+        #         dtype=np.int32
+        #     )
+        # })
+
+        self.observation_space = gym.spaces.Dict({
+            "viewport": gym.spaces.Box(low=0.0, high=1.0, shape=(2, 84, 84), dtype=np.float32),
+            "positions": gym.spaces.Box(low=0.0, high=1.0, shape=(self.n_agents * 2,), dtype=np.float32)
+        })
 
         self.world_gen = Generators.FuelMapGenerator(self.world_size)
         self.view_acc = Viewpoint.IncrementalViewAccumulator(self.world_size, 2)
@@ -93,9 +114,12 @@ class MultiAgentEnv(gym.Env):
     def reset(self, seed = None, options = None):
         self.close()
         self._obs_hsitory, self._agent_positions, self._reward_history, self._view_history, self._pos_history = [], [], [], [], []
-        self._step_count = 0
         
-        self.map = self.world_gen.create_map(0.001, 0.003, seed=seed)
+        self._step_count = 0
+        self._episode_count += 1
+        self._visited_frac = 0.0
+
+        self.map = self.world_gen.create_map(0.001, 0.003, seed=self._episode_count)
         self.visited_map = np.zeros(self.world_size, dtype=np.bool)
         self.view_acc.reset()
         
@@ -104,10 +128,139 @@ class MultiAgentEnv(gym.Env):
         if self.start_poss is None:
             self._agent_positions = [(np.random.randint(0, self.world_size[0]), np.random.randint(0, self.world_size[1])) for _ in range(self.n_agents)]
         else:
-            self._agent_positions = self.start_poss
+            self._agent_positions = [(128, 128), (256, 128), (128, 256), (256, 256)]
 
-        obs, infos = np.zeros((2, *self.world_size), dtype=np.uint8), {}
+        obs = {}
+        obs["viewport"] = np.zeros((2, 84, 84), dtype=np.float32)
+        
+        pos = []
+        for p in self._agent_positions:
+            pos.append(p[0])
+            pos.append(p[1])
+        
+        obs["positions"] = np.asarray(pos, dtype=np.float32) / max(self.world_size)
+
+        infos = {}
         return obs, infos
+
+    def evaluate_risk_map_2(self, scene_obs, eval_radius=50):
+        fuel_map = scene_obs[:, :, 0]
+        fire_map = scene_obs[:, :, 1]
+
+        risk_map = np.zeros(fuel_map.shape, dtype=np.float32)
+
+        fire_coords = np.argwhere(fire_map > 0)  # (N, 2)
+        if len(fire_coords) == 0:
+            return risk_map
+
+        fuel_coords = np.argwhere(fuel_map > 0)  # (M, 2)
+        if len(fuel_coords) == 0:
+            return risk_map
+
+        # build KD-tree on fire coords, query all fuel coords at once
+        tree = cKDTree(fire_coords)
+        nearest_dists, nearest_idxs = tree.query(fuel_coords, k=1, workers=-1)
+
+        # mask out fuel pixels beyond eval_radius
+        in_radius = nearest_dists <= eval_radius
+        fuel_coords  = fuel_coords[in_radius]
+        nearest_dists = nearest_dists[in_radius]
+        nearest_idxs  = nearest_idxs[in_radius]
+
+        if len(fuel_coords) == 0:
+            return risk_map
+
+        fuel_vals = fuel_map[fuel_coords[:, 0], fuel_coords[:, 1]]
+        fire_vals = fire_map[fire_coords[nearest_idxs, 0], fire_coords[nearest_idxs, 1]]
+
+        risks = np.clip((fuel_vals + fire_vals) / (nearest_dists*2 + 1), 0.0, 1.0)
+        risk_map[fuel_coords[:, 0], fuel_coords[:, 1]] = risks
+
+        return risk_map
+
+    def calculate_reward(self, scene_obs, risk_map, prev_visited_frac):
+        """
+        Reward strategy:
+        - Always reward exploration (new area coverage).
+        - If no fire detected yet: pure exploration reward.
+        - If fire detected:
+            - Reward coverage of fire pixels (finding more fire).
+            - Reward coverage of high-risk fuel pixels.
+            - Small continued exploration bonus to keep agents moving.
+        - Penalty for boundary violations (handled in step() via penalty arg).
+
+        Returns (total_reward, new_visited_frac)
+        """
+        fuel_map  = scene_obs[:, :, 0]
+        fire_map  = scene_obs[:, :, 1]
+
+        total_pixels   = scene_obs.shape[0] * scene_obs.shape[1]
+        visited_mask   = (fuel_map > 0) | (fire_map > 0)   # any nonzero = visited
+        visited_frac   = np.sum(visited_mask) / total_pixels
+
+        # --- exploration reward: delta coverage since last step ---
+        exploration_reward = (visited_frac - prev_visited_frac) * 10
+
+        fire_detected = np.any(fire_map > 0)
+
+        if not fire_detected:
+            # pure exploration phase
+            total_reward = exploration_reward
+            return total_reward, visited_frac
+
+        # --- fire coverage reward: fraction of fire pixels in view ---
+        fire_pixels_visible = np.sum(fire_map > 0)
+        fire_coverage_reward = (fire_pixels_visible / (self.vp_size * self.vp_size)) * 10.0
+
+        # --- risk reward: mean risk score over visible high-risk fuel ---
+        high_risk_mask  = risk_map > 0.5
+        if np.any(high_risk_mask):
+            risk_reward = np.mean(risk_map[high_risk_mask]) * 1.50
+        else:
+            risk_reward = 0.0
+
+        # exploration bonus persists so agents keep searching for more fire
+        total_reward = exploration_reward + fire_coverage_reward + risk_reward
+        return total_reward, visited_frac
+    
+    def calculate_reward_2(self, scene_obs, risk_map, prev_visited_frac, delta_views):
+        fuel_map = scene_obs[:, :, 0]
+        fire_map = scene_obs[:, :, 1]
+
+        # --- exploration: new pixels seen this step ---
+        new_pixels = sum(np.sum(d > 0) for d in delta_views)
+        exploration_reward = (new_pixels / (self.vp_size * self.vp_size)) * 2.0
+
+        fire_detected = np.any(fire_map > 0)
+        if not fire_detected:
+            return exploration_reward, prev_visited_frac
+
+        # --- fire coverage ---
+        fire_pixels_visible = np.sum(fire_map > 0)
+        fire_coverage_reward = (fire_pixels_visible / (self.vp_size * self.vp_size)) * 2.0
+
+        # --- fuel-risk reward: score newly seen fuel against the WORLD risk map ---
+        fuel_risk_reward = 0.0
+        for i, (d, pos) in enumerate(zip(delta_views, self._agent_positions)):
+            px, py = pos
+            half = self.vp_size // 2
+            # world-space bounding box of this agent's viewport
+            x0 = np.clip(px - half, 0, self.world_size[0])
+            x1 = np.clip(px + half, 0, self.world_size[0])
+            y0 = np.clip(py - half, 0, self.world_size[1])
+            y1 = np.clip(py + half, 0, self.world_size[1])
+
+            # crop both delta and risk_map to the same world patch
+            risk_patch = risk_map[x0:x1, y0:y1]
+            delta_fuel = d[:risk_patch.shape[0], :risk_patch.shape[1], 0]  # guard edge clips
+
+            fuel_risk_reward += float(np.sum(delta_fuel * risk_patch)) / (self.vp_size * self.vp_size) * 3.0
+
+        # --- risk reward ---
+        high_risk_mask = risk_map > 0.5
+        risk_reward = float(np.mean(risk_map[high_risk_mask])) * 1.5 if np.any(high_risk_mask) else 0.0
+
+        return exploration_reward + fire_coverage_reward + fuel_risk_reward + risk_reward, prev_visited_frac
     
     def evaluate_risk_map(self, map):
         """
@@ -140,63 +293,95 @@ class MultiAgentEnv(gym.Env):
         """
     
     def step(self, action):
-        reward, terminated, truncated, infos = 0.0, False, False, {}
+        reward, terminated, truncated, infos, obs = 0.0, False, False, {}, {}
         loc_pos_history = []
         loc_view_history = []
         penality = 0.1
+        poss = []
+        deltas = []
+
         for i in range(self.n_agents):
+            agent_id = self.agents[i]
             agent_actions = action[self.actions_per_agent*i : self.actions_per_agent*(i+1)]   # for i-th agent, the corresponding action would be [2*i:2*1+1]
             agent_pos:tuple = self._agent_positions[i]
             
             dx, dy = self.get_position_delta_from_action(agent_actions[0]), self.get_position_delta_from_action(agent_actions[1])
             px, py = int(agent_pos[0] + dx), int(agent_pos[1] + dy)
-            
-            if px >= self.world_size[0] or px < 0 or py >= self.world_size[1] or py <= 0:
-                #print(f"Agent {self.agents[i]} hit bounds")
-                self._agent_positions[i] = (px, py)
-                
+
+            self._agent_positions[i] = (px, py)
+            poss.append(px)
+            poss.append(py)
+
+            # if px >= self.world_size[0] or px < 0 or py >= self.world_size[1] or py <= 0:
+            #     #print(f"Agent {self.agents[i]} hit bounds")
+            #     self._agent_positions[i] = (px, py)
+            #     loc_pos_history.append((px - dx, py - dx))
+            #     loc_view_history.append(np.zeros((self.vp_size, self.vp_size, 2), dtype=np.float32))
+            #     penality+=1
+
+            #     continue
+            if px >= self.world_size[0] or px < 0 or py >= self.world_size[1] or py < 0:
+                px = np.clip(px, 0, self.world_size[0] - 1)
+                py = np.clip(py, 0, self.world_size[1] - 1)
+                self._agent_positions[i] = (px, py)   # clamp, don't go OOB
+                penality += 1
+
                 loc_pos_history.append((px - dx, py - dx))
                 loc_view_history.append(np.zeros((self.vp_size, self.vp_size, 2), dtype=np.float32))
-                penality+=1
                 continue
 
             view, delta_view = self.extract_viewpoint(px, py)
+            deltas.append(delta_view)
             self.view_acc.accumulate(view, (px, py), self.vp_size)
-
-            self._agent_positions[i] = (px, py)
             
+            # view = np.transpose(view, (2, 0, 1))      # → (2, H, W)
+            # view = (view * 255).clip(0, 255).astype(np.uint8)
+
             loc_pos_history.append((px, py))
-            loc_view_history.append(view)
+            loc_view_history.append(delta_view)
 
         if penality == self.n_agents:
             terminated=True
 
-        obs = self.view_acc.get_scene()
-        fuel_obs, fire_obs = obs[:, :, 0], obs[:, :, 1] 
-        
-        fuel_reward = (np.sum(fuel_obs) / (self.vp_size * self.vp_size) )
-        fire_reward = (np.sum(fire_obs) / (self.vp_size * self.vp_size) )
+        scene_obs = self.view_acc.get_scene()
 
-        penality_scale = 5
-        fire_scale = 10
-        total_reward = fuel_reward + (fire_scale*fire_reward)
-        total_reward = total_reward - (penality_scale * penality)
+        penality_scale = 1
+
+        prev_visited_frac = getattr(self, "_visited_frac", 0.0)
+        risk_map = self.evaluate_risk_map_2(scene_obs, eval_radius=100)
+        total_reward, new_visited_frac = self.calculate_reward_2(scene_obs, risk_map, prev_visited_frac, deltas)
+        self._visited_frac = new_visited_frac
+
+        total_reward -= penality_scale * penality
+  
 
         self._reward_history.append(total_reward)
-        self._obs_hsitory.append(obs)
+        if risk_map is not None:
+            new_composite = np.zeros((self.world_size[0], self.world_size[1], 2), dtype=np.float32)
+            new_composite[:, :, 0] = risk_map
+            new_composite[:, :, 1] = scene_obs[:, :, 1]
+            self._obs_hsitory.append(new_composite)
+        else:
+            self._obs_hsitory.append(scene_obs)
         self._view_history.append(loc_view_history)
         self._pos_history.append(loc_pos_history)
 
         self._step_count+=1
 
-        if self.render_mode == "human":
+        if self.render_mode == "human" and (self._episode_count % self.sample_int) == 0:
             self.render()
+        
+        viewport = np.transpose(scene_obs, (2, 0, 1)).astype(np.float32)
+        viewport_small = np.stack([
+            cv2.resize(viewport[c], (84, 84), interpolation=cv2.INTER_AREA)
+            for c in range(viewport.shape[0])
+        ])
+        
+        obs["viewport"] = viewport_small
+        obs["positions"] = np.asarray(poss, dtype=np.int32)
 
         if self._step_count > self.iter_limit:
             terminated = True
-
-        obs = np.transpose(obs, (2, 0, 1))      # → (2, H, W)
-        obs = (obs * 255).clip(0, 255).astype(np.uint8)  # if scene is float [0,1]
 
         return obs, total_reward, terminated, truncated, infos
     
@@ -370,7 +555,7 @@ class MultiAgentEnv(gym.Env):
 
         # ── Figure title ──────────────────────────────────────────────
         self._fig.suptitle(
-            f"Step {self._step_count}",
+            f"Episode {self._episode_count} | Step {self._step_count}",
             color="white", fontsize=11, fontweight="bold", y=0.97
         )
 
@@ -397,9 +582,36 @@ class MultiAgentEnv(gym.Env):
 from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import VecEnv
 
-env = MultiAgentEnv(n_agents=3, world_size=(512, 512), render_mode="human")
-model = PPO("CnnPolicy", env, verbose=1, learning_rate=1e-3, batch_size=128, n_steps=128)
-model.learn(total_timesteps=10000)
+from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
+
+env = DummyVecEnv(
+    [lambda: MultiAgentEnv(
+            n_agents=4,
+            world_size=(512, 512),
+            start_positions=[(128, 128), (256, 128), (128, 256), (256, 256)],  # fixed grid
+            render_mode="human",
+            sample_interval=10
+        )
+    ]
+)
+env = VecNormalize(env, norm_obs=False, norm_reward=True, clip_reward=10.0)
+
+model = PPO(
+    "MultiInputPolicy", env,
+    verbose=1,
+    learning_rate=1e-4,          # lower — reward scale is high
+    batch_size=256,
+    n_steps=2048,                # ~20 full episodes per rollout
+    n_epochs=10,
+    gamma=0.99,
+    gae_lambda=0.95,
+    ent_coef=0.05,               # higher entropy to fight premature convergence
+    vf_coef=0.5,
+    max_grad_norm=0.5,
+    clip_range=0.2,
+)
+
+model.learn(total_timesteps=500_000)
 
 # for episode in range(10):
 #     obs, _ = env.reset()
