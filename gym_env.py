@@ -13,7 +13,6 @@ from utils import Generators, Viewpoint
 from agents import Drone
 
 
-
 class MultiAgentEnv(gym.Env):
 
     metadata = {"render_modes": ["human", "rgb_array"], "render_fps": 30, "name": "multi_drone_v0"}
@@ -55,7 +54,7 @@ class MultiAgentEnv(gym.Env):
 
 
         self.vp_size = 64
-        self.step_size = 5
+        self.step_size = 1
 
         # sort of flattening the multi agent space into a 1D single agent space.
         # TODO : Encoder can make it input shape agnostic
@@ -163,11 +162,15 @@ class MultiAgentEnv(gym.Env):
         self.view_acc.reset()
         
         self.agents = [f"agent_{i}" for i in range(self.n_agents)]
+        self.agent_instances = [Drone.Drone(f"agent_{i}") for i in range(self.n_agents)]
 
         if self.start_poss is None:
             self._agent_positions = [(np.random.randint(0, self.world_size[0]), np.random.randint(0, self.world_size[1])) for _ in range(self.n_agents)]
         else:
             self._agent_positions = [(128, 128), (256, 128), (128, 256), (256, 256)][:self.n_agents]
+
+        for p, a in zip(self._agent_positions, self.agent_instances):
+            a.set_position({'x':p[0], 'y':p[1], 'z':0})
 
         obs = {}
         obs["viewport"] = np.zeros((2, 84, 84), dtype=np.float32)
@@ -341,7 +344,7 @@ class MultiAgentEnv(gym.Env):
         if y - self.vp_size <= 0:
             near_bound_penality += abs(y - self.vp_size)
 
-        return 0.01 * near_bound_penality
+        return 0.05 * near_bound_penality
 
     def step(self, action):
         reward, terminated, truncated, infos, obs = 0.0, False, False, {}, {}
@@ -355,12 +358,14 @@ class MultiAgentEnv(gym.Env):
         nb_penality = 0
 
         for i in range(self.n_agents):
-            agent_id = self.agents[i]
+            agent:Drone.Drone = self.agent_instances[i]
             agent_actions = action[self.actions_per_agent*i : self.actions_per_agent*(i+1)]   # for i-th agent, the corresponding action would be [2*i:2*1+1]
             agent_pos:tuple = self._agent_positions[i]
             
             dx, dy = self.get_position_delta_from_action(agent_actions[0]), self.get_position_delta_from_action(agent_actions[1])
-            px, py = int(agent_pos[0] + dx), int(agent_pos[1] + dy)
+            agent.inject_velocity({"x" : dx, "y":dy, "z": 0})
+
+            px, py = int(agent.get_position_array()[0]), int(agent.get_position_array()[1])
 
             self._agent_positions[i] = (px, py)
             poss.append(px)
@@ -425,7 +430,8 @@ class MultiAgentEnv(gym.Env):
         total_reward -= nb_penality
 
         self._reward_history.append(total_reward)
-        if risk_map is not None:
+        show_risk_map = False
+        if show_risk_map and risk_map is not None:
             new_composite = np.zeros((self.world_size[0], self.world_size[1], 2), dtype=np.float32)
             new_composite[:, :, 0] = risk_map
             new_composite[:, :, 1] = scene_obs[:, :, 1]
@@ -691,7 +697,7 @@ env = DummyVecEnv(
             world_size=(512, 512),
             start_positions=[(256, 256), (256, 128), (128, 256), (256, 256)],  # fixed grid
             render_mode="human",
-            sample_interval=50,
+            sample_interval=5,
             save_interval=100,
             seed=None,
             is_vid_out=True,
