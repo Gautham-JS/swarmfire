@@ -107,18 +107,21 @@ def get_square_viewpoint(array: np.ndarray, point: tuple[int, int], size: int = 
     return viewpoint
 
 
-def get_square_viewpoint_and_mark_visited(array: np.ndarray, visited: np.ndarray, point: tuple[int, int], size: int = 16) -> np.ndarray:
+def get_square_viewpoint_and_mark_visited(
+    array: np.ndarray,
+    visited: np.ndarray,
+    point: tuple[int, int],
+    size: int = 16
+) -> np.ndarray:
     H, W = array.shape
     row, col = point
     half = size // 2
 
-    # Source bounds (clamped to array edges)
     src_row_start = max(0, row - half)
     src_row_end   = min(H, row - half + size)
     src_col_start = max(0, col - half)
     src_col_end   = min(W, col - half + size)
 
-    # Destination bounds (where to place in output)
     dst_row_start = src_row_start - (row - half)
     dst_row_end   = dst_row_start + (src_row_end - src_row_start)
     dst_col_start = src_col_start - (col - half)
@@ -127,10 +130,18 @@ def get_square_viewpoint_and_mark_visited(array: np.ndarray, visited: np.ndarray
     viewpoint = np.zeros((size, size), dtype=array.dtype)
     viewpoint[dst_row_start:dst_row_end, dst_col_start:dst_col_end] = \
         array[src_row_start:src_row_end, src_col_start:src_col_end]
-    
-    old_visited_mask = np.zeros((size, size), dtype=np.bool)
-    old_visited_mask[dst_row_start:dst_row_end, dst_col_start:dst_col_end] = visited[src_row_start:src_row_end, src_col_start:src_col_end] > 0
-    delta_mask = np.logical_not(old_visited_mask).copy()
+
+    # Mask of pixels that are actually inside world bounds (not padded)
+    valid_mask = np.zeros((size, size), dtype=np.bool_)
+    valid_mask[dst_row_start:dst_row_end, dst_col_start:dst_col_end] = True
+
+    # Previously visited, within valid bounds only
+    old_visited_mask = np.zeros((size, size), dtype=np.bool_)
+    old_visited_mask[dst_row_start:dst_row_end, dst_col_start:dst_col_end] = \
+        visited[src_row_start:src_row_end, src_col_start:src_col_end] > 0
+
+    # Delta: valid AND not previously visited
+    delta_mask = valid_mask & ~old_visited_mask
 
     visited[src_row_start:src_row_end, src_col_start:src_col_end] = True
 
