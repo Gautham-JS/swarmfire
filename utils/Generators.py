@@ -284,7 +284,7 @@ class FuelMapGenerator:
 
         world_map = np.zeros((self.size[0], self.size[0], 2), dtype=np.float32)
 
-        fire_masks, wind_vectors = self.generate_fire_perimeter_timeseries(self.size, 3, growth_rate=0.03, wind_strength=1.0)
+        fire_masks, wind_vectors = self.generate_fire_perimeter_timeseries(self.size, 3, width_mean=5, fronts_per_step=5, edge_sigma=0.1, growth_rate=0.03, wind_strength=1.0, seed=seed)
         fire_mask = fire_masks[0]
         
         w = 0.7
