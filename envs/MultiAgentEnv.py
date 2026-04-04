@@ -9,7 +9,7 @@ from matplotlib.gridspec import GridSpec
 import cv2
 import os
 
-from utils import Generators, Viewpoint
+from utils import Generators, Viewpoint, GenericUtils
 from agents import Drone
 
 
@@ -156,11 +156,11 @@ class MultiAgentEnv(gym.Env):
         self._step_count = 0
         self._episode_count += 1
         self._visited_frac = 0.0
-        if self.seed is not None and self._episode_count > 100:
-            if self._episode_count - 1 < 1000:
+        if self.seed is not None and self._episode_count > 10:
+            if self._episode_count - 1 < 200:
                 self.map = self.world_gen.create_map(0.001, 0.003, seed=self.seed)
-            elif self._episode_count - 1 < 2000:
-                if self._episode_count - 1 % 100 == 0:
+            elif self._episode_count - 1 < 500:
+                if self._episode_count - 1 % 20 == 0:
                     self.seed+=1
                 self.map = self.world_gen.create_map(0.001, 0.003, seed = self.seed)
             else:
@@ -306,7 +306,10 @@ class MultiAgentEnv(gym.Env):
             recency_patch = recency_map[x0:x1, y0:y1]
             revisit_penalty += float(np.mean(recency_patch)) * self._r_revisit_penality  # _r_revisit_penality is negative
 
-        return exploration_reward + fire_discovery_reward + fuel_risk_reward + revisit_penalty, prev_visited_frac
+        total_visited = np.sum(self.visited_map)
+        total_cells   = self.world_size[0] * self.world_size[1]
+        coverage_bonus = (total_visited / total_cells) * 3.0
+        return exploration_reward + fire_discovery_reward + fuel_risk_reward + revisit_penalty, prev_visited_frac + coverage_bonus
     
     def evaluate_risk_map(self, map):
         """
@@ -353,18 +356,18 @@ class MultiAgentEnv(gym.Env):
             rewards.append(2.0 * new_fuel + 5.0 * new_fire + 4.0 * risk_score)
         return rewards 
     
-    def calculate_near_boundary_penality(self, x, y):
-        near_bound_penality = 0
-        if x + self.vp_size >= self.world_size[0]:
-            near_bound_penality += abs(self.world_size[0] - (x + self.vp_size))
-        if x - self.vp_size <= 0:
-            near_bound_penality += abs(x - self.vp_size)
-        if y + self.vp_size >= self.world_size[1]:
-            near_bound_penality += abs(self.world_size[1] - (y + self.vp_size))
-        if y - self.vp_size <= 0:
-            near_bound_penality += abs(y - self.vp_size)
-
-        return 0.05 * near_bound_penality
+    def calculate_near_boundary_penalty(self, x, y):
+        margin = self.vp_size  # start penalising one viewport-width from the edge
+        penalty = 0.0
+        for coord, limit in [(x, self.world_size[0]), (y, self.world_size[1])]:
+            # distance from each of the two walls for this axis
+            dist_low  = coord
+            dist_high = limit - coord
+            if dist_low < margin:
+                penalty += np.exp((margin - dist_low) / (margin / 3)) - 1
+            if dist_high < margin:
+                penalty += np.exp((margin - dist_high) / (margin / 3)) - 1
+        return 0.1 * penalty
 
     def mark_recency_map(self, px, py):
         half = self.vp_size // 2
@@ -417,8 +420,9 @@ class MultiAgentEnv(gym.Env):
         per_agent_views = []
 
         nb_penality = 0
-
         self.recency_map *= self._recency_decay
+        is_oob = False
+
 
         for i in range(self.n_agents):
             agent:Drone.Drone = self.agent_instances[i]
@@ -434,7 +438,7 @@ class MultiAgentEnv(gym.Env):
             poss.append(px)
             poss.append(py)
 
-            nb_penality += self.calculate_near_boundary_penality(px, py)
+            nb_penality += self.calculate_near_boundary_penalty(px, py)
             view_recency = self.mark_recency_map(px, py)
 
             # if px >= self.world_size[0] or px < 0 or py >= self.world_size[1] or py <= 0:
@@ -448,14 +452,16 @@ class MultiAgentEnv(gym.Env):
             if px >= self.world_size[0] or px < 0 or py >= self.world_size[1] or py < 0:
                 px = np.clip(px, 0, self.world_size[0] - 1)
                 py = np.clip(py, 0, self.world_size[1] - 1)
-                self._agent_positions[i] = (px, py)   # clamp, don't go OOB
-                penality += 1
+                self._agent_positions[i] = (px, py)
+                agent.set_position({'x': px, 'y': py, 'z': 0})  # zero out accumulated velocity
+                penality += 10   # much heavier than your current 1
+                # don't terminate, don't continue — still extract view from clamped pos
 
-                loc_pos_history.append((px - dx, py - dx))
-                loc_view_history.append(np.zeros((self.vp_size, self.vp_size, 2), dtype=np.float32))
-                print("SHI OOB BRUH")
-                terminated=True
-                continue
+                # loc_pos_history.append((px, py - dx))
+                # loc_view_history.append(np.zeros((self.vp_size, self.vp_size, 2), dtype=np.float32))
+                is_oob = True
+                #terminated=True
+                #continue
             
 
             view, delta_view = self.extract_viewpoint(px, py)

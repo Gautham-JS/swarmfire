@@ -13,9 +13,9 @@ env = DummyVecEnv(
             world_size=(512, 512),
             start_positions=[(256, 256), (256, 128), (128, 256), (256, 256)],  # fixed grid
             render_mode="human",
-            sample_interval=25,
-            save_interval=500,
-            seed=13,
+            sample_interval=100,
+            save_interval=100,
+            seed=None,
             is_vid_out=True,
             vid_id="no_swarming_global_reward",
             vid_base_path="/home/gjs/software/thesis/swarmfire/vids/"
@@ -36,7 +36,7 @@ model = PPO(
     ent_coef=0.05,               # higher entropy to fight premature convergence
     vf_coef=0.5,
     max_grad_norm=0.5,
-    clip_range=0.2,
+    clip_range=0.2
 )
 
 
