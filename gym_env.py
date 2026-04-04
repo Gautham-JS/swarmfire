@@ -13,7 +13,7 @@ env = DummyVecEnv(
             world_size=(512, 512),
             start_positions=[(256, 256), (256, 128), (128, 256), (256, 256)],  # fixed grid
             render_mode="human",
-            sample_interval=500,
+            sample_interval=25,
             save_interval=500,
             seed=13,
             is_vid_out=True,
@@ -40,8 +40,6 @@ model = PPO(
 )
 
 
-import gym
-gym.__version__ = "0.26.0"
 
 model.learn(total_timesteps=500_000)
 model.save("./single_agent.zip")

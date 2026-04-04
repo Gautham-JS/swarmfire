@@ -46,6 +46,9 @@ class MultiAgentEnv(gym.Env):
 
         self._episode_count = 0
 
+        self._recency_decay = 0.995   # per-step decay factor; tune this
+        self._recency_visit_bump = 1.0  # value stamped on visit
+
         # reward fn weights
         self._r_fire_wt = 5.0
         self._r_fuel_wt = 2.0
@@ -88,7 +91,7 @@ class MultiAgentEnv(gym.Env):
         # })
 
         self.observation_space = gym.spaces.Dict({
-            "viewport": gym.spaces.Box(low=0.0, high=1.0, shape=(2, 84, 84), dtype=np.float32),
+            "viewport": gym.spaces.Box(low=0.0, high=1.0, shape=(3, 84, 84), dtype=np.float32),
             "positions": gym.spaces.Box(low=0.0, high=1.0, shape=(self.n_agents * 2,), dtype=np.float32)
         })
 
@@ -107,6 +110,8 @@ class MultiAgentEnv(gym.Env):
         self._agent_positions = None
         self._step_count = 0
 
+        self.recency_map = None
+
         # render states
         self._fig = None
         self._axes = None
@@ -118,6 +123,10 @@ class MultiAgentEnv(gym.Env):
             self.vid_id = vid_id
             self.fps = 30
 
+    def create_model_descriptor_dict(self):
+        d = {}
+        d["n_agents"] = self.n_agents
+        d["observation_space"] = "gym.spaces.Dict\{'viewport': gym.spaces.Box(low=0.0, high=1.0, shape=(3, 84, 84), dtype=np.float32), \}"
 
     def get_position_delta_from_action(self, action):
         if action == 0:
@@ -159,6 +168,7 @@ class MultiAgentEnv(gym.Env):
         else:
             self.map = self.world_gen.create_map(0.001, 0.003, seed=self.seed)
         self.visited_map = np.zeros(self.world_size, dtype=np.bool)
+        self.recency_map = np.zeros(self.world_size, dtype=np.float32)
         self.view_acc.reset()
         
         self.agents = [f"agent_{i}" for i in range(self.n_agents)]
@@ -172,8 +182,10 @@ class MultiAgentEnv(gym.Env):
         for p, a in zip(self._agent_positions, self.agent_instances):
             a.set_position({'x':p[0], 'y':p[1], 'z':0})
 
+
+        self._last_global_vp = None
         obs = {}
-        obs["viewport"] = np.zeros((2, 84, 84), dtype=np.float32)
+        obs["viewport"] = np.zeros((3, 84, 84), dtype=np.float32)
         
         pos = []
         for p in self._agent_positions:
@@ -184,7 +196,7 @@ class MultiAgentEnv(gym.Env):
 
         infos = {}
         print(f"[RESET] : Starting episode {self._episode_count}")
-        print(obs)
+        #print(obs)
         return obs, infos
 
     def evaluate_risk_map_2(self, scene_obs, eval_radius=50):
@@ -267,27 +279,34 @@ class MultiAgentEnv(gym.Env):
         total_reward = exploration_reward + fire_coverage_reward + risk_reward
         return total_reward, visited_frac
     
-    def calculate_reward_2(self, scene_obs, risk_map, prev_visited_frac, delta_views):
-        # delta_views already captures new-pixel info — use that exclusively for exploration
+    def calculate_reward_2(self, scene_obs, risk_map, prev_visited_frac, delta_views, recency_map):
         new_fuel_pixels = sum(np.sum(d[:, :, 0] > 0) for d in delta_views)
         new_fire_pixels = sum(np.sum(d[:, :, 1] > 0) for d in delta_views)
 
         exploration_reward = (new_fuel_pixels / (self.vp_size * self.vp_size * self.n_agents)) * 2.0
         fire_discovery_reward = (new_fire_pixels / (self.vp_size * self.vp_size * self.n_agents)) * 100.0
 
-        # fuel-risk reward: only on NEWLY seen fuel this step
         fuel_risk_reward = 0.0
+        revisit_penalty = 0.0
+
         for delta, pos in zip(delta_views, self._agent_positions):
             px, py = pos
             half = self.vp_size // 2
-            x0, x1 = np.clip(px - half, 0, self.world_size[0]), np.clip(px + half, 0, self.world_size[0])
-            y0, y1 = np.clip(py - half, 0, self.world_size[1]), np.clip(py + half, 0, self.world_size[1])
+            x0 = np.clip(px - half, 0, self.world_size[0])
+            x1 = np.clip(px + half, 0, self.world_size[0])
+            y0 = np.clip(py - half, 0, self.world_size[1])
+            y1 = np.clip(py + half, 0, self.world_size[1])
+
             risk_patch = risk_map[x0:x1, y0:y1]
             h, w = risk_patch.shape
             delta_fuel = delta[:h, :w, 0]
-            fuel_risk_reward += float(np.sum(delta_fuel * risk_patch)) / (self.vp_size * self.vp_size) * self._r_fire_wt
+            fuel_risk_reward += float(np.sum(delta_fuel * risk_patch)) / (self.vp_size ** 2) * self._r_fire_wt
 
-        return exploration_reward + fire_discovery_reward + fuel_risk_reward, prev_visited_frac
+            # revisit penalty: mean recency heat under this agent's footprint
+            recency_patch = recency_map[x0:x1, y0:y1]
+            revisit_penalty += float(np.mean(recency_patch)) * self._r_revisit_penality  # _r_revisit_penality is negative
+
+        return exploration_reward + fire_discovery_reward + fuel_risk_reward + revisit_penalty, prev_visited_frac
     
     def evaluate_risk_map(self, map):
         """
@@ -347,6 +366,47 @@ class MultiAgentEnv(gym.Env):
 
         return 0.05 * near_bound_penality
 
+    def mark_recency_map(self, px, py):
+        half = self.vp_size // 2
+        x0 = np.clip(px - half, 0, self.world_size[0])
+        x1 = np.clip(px + half, 0, self.world_size[0])
+        y0 = np.clip(py - half, 0, self.world_size[1])
+        y1 = np.clip(py + half, 0, self.world_size[1])
+        self.recency_map[x0:x1, y0:y1] = np.maximum(
+            self.recency_map[x0:x1, y0:y1],
+            self._recency_visit_bump
+        )
+        return self.recency_map[x0:x1, y0:y1]
+
+    def extract_recency_map(self, px, py):
+        half = self.vp_size // 2
+        x0 = np.clip(px - half, 0, self.world_size[0])
+        x1 = np.clip(px + half, 0, self.world_size[0])
+        y0 = np.clip(py - half, 0, self.world_size[1])
+        y1 = np.clip(py + half, 0, self.world_size[1])
+        return self.recency_map[x0:x1, y0:y1]
+
+    def create_global_crop_viewport_obs(self, sz=84):
+        scene = self.view_acc.get_scene()   # (H, W, 2) — fuel + fire only
+        cx = int(np.mean([p[0] for p in self._agent_positions]))
+        cy = int(np.mean([p[1] for p in self._agent_positions]))
+        half = sz//2
+
+        x0 = np.clip(cx - half, 0, self.world_size[0])
+        x1 = np.clip(cx + half, 0, self.world_size[0])
+        y0 = np.clip(cy - half, 0, self.world_size[1])
+        y1 = np.clip(cy + half, 0, self.world_size[1])
+
+        scene_crop = scene[x0:x1, y0:y1, :]                                            # (H', W', 2)
+        scene_crop_resized = cv2.resize(scene_crop, (84, 84), interpolation=cv2.INTER_AREA)
+        scene_chw = np.transpose(scene_crop_resized, (2, 0, 1))                         # (2, 84, 84)
+
+        # recency channel from the same spatial crop
+        recency_crop = self.recency_map[x0:x1, y0:y1]                                  # (H', W')
+        recency_resized = cv2.resize(recency_crop, (84, 84), interpolation=cv2.INTER_AREA)[None]  # (1, 84, 84)
+
+        return np.concatenate([scene_chw, recency_resized], axis=0).astype(np.float32)  # (3, 84, 84)
+
     def step(self, action):
         reward, terminated, truncated, infos, obs = 0.0, False, False, {}, {}
         loc_pos_history = []
@@ -357,6 +417,8 @@ class MultiAgentEnv(gym.Env):
         per_agent_views = []
 
         nb_penality = 0
+
+        self.recency_map *= self._recency_decay
 
         for i in range(self.n_agents):
             agent:Drone.Drone = self.agent_instances[i]
@@ -373,6 +435,7 @@ class MultiAgentEnv(gym.Env):
             poss.append(py)
 
             nb_penality += self.calculate_near_boundary_penality(px, py)
+            view_recency = self.mark_recency_map(px, py)
 
             # if px >= self.world_size[0] or px < 0 or py >= self.world_size[1] or py <= 0:
             #     #print(f"Agent {self.agents[i]} hit bounds")
@@ -400,10 +463,13 @@ class MultiAgentEnv(gym.Env):
             view_fuel = Viewpoint.get_square_viewpoint(self.map[:, :, 0], (px, py), self.vp_size)
             view_fire = Viewpoint.get_square_viewpoint(self.map[:, :, 1], (px, py), self.vp_size)
             view_agent = np.stack([view_fuel, view_fire], axis=0)  # (2, vp_size, vp_size)
+            
             small = np.stack([
-                cv2.resize(view_agent[c], (84, 84), interpolation=cv2.INTER_AREA)
-                for c in range(2)
+                cv2.resize(view_agent[0], (84, 84), interpolation=cv2.INTER_AREA),
+                cv2.resize(view_agent[1], (84, 84), interpolation=cv2.INTER_AREA),
+                cv2.resize(view_recency, (84, 84), interpolation=cv2.INTER_AREA)
             ])
+            
             per_agent_views.append(small)
 
             deltas.append(delta_view)
@@ -424,7 +490,9 @@ class MultiAgentEnv(gym.Env):
 
         prev_visited_frac = getattr(self, "_visited_frac", 0.0)
         risk_map = self.evaluate_risk_map_2(scene_obs, eval_radius=100)
-        total_reward, new_visited_frac = self.calculate_reward_2(scene_obs, risk_map, prev_visited_frac, deltas)
+        total_reward, new_visited_frac = self.calculate_reward_2(
+            scene_obs, risk_map, prev_visited_frac, deltas, self.recency_map
+        )
         self._visited_frac = new_visited_frac
 
         total_reward -= penality_scale * penality
@@ -447,47 +515,84 @@ class MultiAgentEnv(gym.Env):
         if self.render_mode == "human" and (self._episode_count % self.sample_int) == 0:
             self.render()
         
-        obs["viewport"] = np.mean(per_agent_views, axis=0).astype(np.float32)
+
+        
+
+
+        obs["viewport"] = self.create_global_crop_viewport_obs()
         obs["positions"] = np.asarray(poss, dtype=np.float32) / max(self.world_size)
 
         if self._step_count > self.iter_limit:
             terminated = True
+        self._last_global_vp = obs["viewport"].copy()
 
         return obs, total_reward, terminated, truncated, infos
+    
+
+
+
+
+
+    def _channels_to_rgb(self, chw: np.ndarray) -> np.ndarray:
+        """
+        Convert a (C, H, W) float32 array to an (H, W, 3) RGB image.
+        - C == 1 : greyscale repeated to 3 channels
+        - C == 2 : fuel=G, fire=R, B=0
+        - C == 3 : fuel=G, fire=R, recency=B
+        - C  > 3 : PCA projected to 3 components, then normalised to [0,1]
+        """
+        c, h, w = chw.shape
+
+        if c == 1:
+            grey = chw[0]
+            return np.stack([grey, grey, grey], axis=-1)
+
+        if c == 2:
+            canvas = np.zeros((h, w, 3), dtype=np.float32)
+            canvas[:, :, 1] = chw[0]   # fuel → green
+            canvas[:, :, 0] = chw[1]   # fire → red
+            return canvas
+
+        if c == 3:
+            canvas = np.zeros((h, w, 3), dtype=np.float32)
+            canvas[:, :, 1] = chw[0]   # fuel    → green
+            canvas[:, :, 0] = chw[1]   # fire    → red
+            canvas[:, :, 2] = chw[2]   # recency → blue
+            return canvas
+
+        # C > 3 — PCA onto 3 components
+        flat = chw.reshape(c, -1).T          # (H*W, C)
+        flat -= flat.mean(axis=0)
+        _, _, Vt = np.linalg.svd(flat, full_matrices=False)
+        projected = flat @ Vt[:3].T          # (H*W, 3)
+        projected -= projected.min(axis=0)
+        denom = projected.max(axis=0)
+        denom[denom == 0] = 1
+        projected /= denom
+        return projected.reshape(h, w, 3).astype(np.float32)
+
     
     def _init_figure(self):
         """Create the figure layout once and reuse it across frames."""
         n_agents = max(self.n_agents, 1)
 
-        # Layout: left column = full map, right columns = per-agent viewports
-        # self._fig = plt.figure(
-        #     figsize=(4 + 3 * n_agents, 5),
-        #     facecolor="#1a1a2e"
-        # )
-        # gs = GridSpec(
-        #     2, 1 + n_agents,
-        #     figure=self._fig,
-        #     hspace=0.4, wspace=0.35,
-        #     left=0.06, right=0.97, top=0.88, bottom=0.08
-        # )
-
         self._fig = plt.figure(
-            figsize=(4 + 3 + 3 * n_agents, 5),  # extra 3 for obs column
+            figsize=(4 + 3 + 3 + 3 * n_agents, 5),   # extra 3 for global crop panel
             facecolor="#1a1a2e"
         )
         gs = GridSpec(
-            2, 2 + n_agents,          # 2 fixed cols (map + obs) + n_agents cols
+            2, 3 + n_agents,          # map | obs | global_crop | agent cols
             figure=self._fig,
             hspace=0.4, wspace=0.35,
             left=0.06, right=0.97, top=0.88, bottom=0.08
         )
 
-
-        self._ax_map = self._fig.add_subplot(gs[:, 0])          # full map spans both rows
-        self._ax_obs = self._fig.add_subplot(gs[:, 1])
-        self._ax_viewports = [
-            (self._fig.add_subplot(gs[0, i + 2]),               # viewport image
-             self._fig.add_subplot(gs[1, i + 2]))               # reward bar
+        self._ax_map        = self._fig.add_subplot(gs[:, 0])
+        self._ax_obs        = self._fig.add_subplot(gs[:, 1])
+        self._ax_global_vp  = self._fig.add_subplot(gs[:, 2])   # ← new
+        self._ax_viewports  = [
+            (self._fig.add_subplot(gs[0, i + 3]),
+            self._fig.add_subplot(gs[1, i + 3]))
             for i in range(n_agents)
         ]
 
@@ -654,6 +759,33 @@ class MultiAgentEnv(gym.Env):
             )
             for spine in ax_bar.spines.values():
                 spine.set_edgecolor("#333")
+
+
+        if self._last_global_vp is not None:
+            rgb = self._channels_to_rgb(self._last_global_vp)   # (84, 84, 3)
+            ax = self._ax_global_vp
+            ax.cla()
+            ax.imshow(rgb, origin="upper", vmin=0.0, vmax=1.0, interpolation="nearest")
+            c = self._last_global_vp.shape[0]
+            label = "Global VP" if c <= 3 else f"Global VP (PCA {c}ch)"
+            ax.set_title(label, color="white", fontsize=9, pad=4)
+            ax.set_facecolor("#0d0d1a")
+            ax.tick_params(left=False, bottom=False, labelleft=False, labelbottom=False)
+
+            # channel legend in the corner
+            legend_lines = {
+                1: ["grey=fuel/fire"],
+                2: ["G=fuel", "R=fire"],
+                3: ["G=fuel", "R=fire", "B=recency"],
+            }
+            for line_i, txt in enumerate(legend_lines.get(c, ["PCA projected"])):
+                ax.text(
+                    2, 4 + line_i * 9, txt,
+                    color="white", fontsize=5,
+                    bbox=dict(facecolor="#00000088", edgecolor="none", pad=1)
+                )
+            for spine in ax.spines.values():
+                spine.set_edgecolor("#444")
 
         # ── Figure title ──────────────────────────────────────────────
         self._fig.suptitle(
