@@ -5,10 +5,41 @@ from policies import ResNetActorCriticModel, TemporalTransformerModel
 from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
 from stable_baselines3.common.callbacks import BaseCallback
-
+from stable_baselines3.common.vec_env import SubprocVecEnv
 
 import torch.nn as nn
 from stable_baselines3.common.callbacks import CheckpointCallback, EvalCallback
+
+
+
+
+
+
+N_ENVS = 4
+
+
+def make_env(rank):
+    def _init():
+        return MultiAgentEnv(
+            n_agents=1,
+            world_size=(512, 512),
+            start_positions=[(128, 128), (256, 128), (128, 256), (256, 256)],
+            render_mode="human",  # only rank 0 renders
+            sample_interval=200 if rank == 0 else 999999,
+            save_interval=200 if rank == 0 else 999999,
+            seed=34,
+            fixed_seed=False,
+            is_vid_out=True if rank == 0 else False,
+            iter_limit=500,
+            vid_id="no_swarming_global_reward",
+            vid_base_path="./vids/"
+        )
+    return _init
+
+ 
+
+
+
 
 
 class MemoryResetCallback(BaseCallback):
@@ -49,14 +80,38 @@ eval_cb = EvalCallback(
 )
 
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 env = DummyVecEnv(
     [lambda: MultiAgentEnv(
             n_agents=1,
             world_size=(512, 512),
             start_positions=[(256, 256), (256, 128), (128, 256), (256, 256)],  # fixed grid
             render_mode="human",
-            sample_interval=20,
-            save_interval=20,
+            sample_interval=200,
+            save_interval=200,
             seed=34,
             fixed_seed=False,
             is_vid_out=True,
@@ -66,9 +121,6 @@ env = DummyVecEnv(
         )
     ]
 )
-env = VecNormalize(env, norm_obs=False, norm_reward=True, clip_reward=10.0)
-
-
 
 resnet_policy_kwargs = dict(
     features_extractor_class = ResNetActorCriticModel.FireScoutExtractor,
@@ -103,7 +155,7 @@ model = PPO(
     verbose=1,
     learning_rate=1e-4,
     batch_size=256,
-    n_steps=2048,
+    n_steps=2048 // N_ENVS,
     n_epochs=10,
     gamma=0.98,
     gae_lambda=0.95,
@@ -114,11 +166,30 @@ model = PPO(
 )
 
 
+if __name__ == "__main__":
+    N_ENVS = 4
 
+    env = SubprocVecEnv([make_env(i) for i in range(N_ENVS)])
+    env = VecNormalize(env, norm_obs=False, norm_reward=True, clip_reward=10.0)
 
-model.learn(total_timesteps=5_000_000, callback=MemoryResetCallback())
-model.save("./single_agent_xformer.zip")
+    model = PPO(
+        "MultiInputPolicy", env,
+        policy_kwargs=dict(
+            features_extractor_class=TemporalTransformerModel.TemporalTransformerExtractor,
+            features_extractor_kwargs=dict(features_dim=256, n_heads=4, n_layers=3),
+        ),
+        verbose=1,
+        learning_rate=1e-4,
+        n_steps=512,
+        batch_size=256,
+        n_epochs=10,
+        gamma=0.99,
+        ent_coef=0.05,
+    )
 
+    model.learn(total_timesteps=5_000_000, callback=MemoryResetCallback())
+    model.save("./checkpoints/final_model")
+    env.close()
 
 
 

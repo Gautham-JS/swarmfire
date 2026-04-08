@@ -1,6 +1,7 @@
 import gymnasium as gym
 import numpy as np
 from scipy.spatial import cKDTree
+import torch
 
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
@@ -45,6 +46,8 @@ class MultiAgentEnv(gym.Env):
         self.sample_int = sample_interval
         self.save_int = save_interval
         self.fixed_seed = fixed_seed
+
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
         self._episode_count = 0
 
@@ -172,6 +175,54 @@ class MultiAgentEnv(gym.Env):
         print(f"[RESET] : Starting episode {self._episode_count}")
         #print(obs)
         return obs, infos
+
+    def evaluate_risk_map_gpu(self, scene_obs, eval_radius=100):
+        fuel_map = scene_obs[:, :, 0]
+        fire_map = scene_obs[:, :, 1]
+
+        fire_coords = np.argwhere(fire_map > 0)
+        if len(fire_coords) == 0:
+            return np.zeros(fuel_map.shape, dtype=np.float32)
+
+        fuel_coords = np.argwhere(fuel_map > 0)
+        if len(fuel_coords) == 0:
+            return np.zeros(fuel_map.shape, dtype=np.float32)
+
+        # Move to GPU
+        fire_t = torch.from_numpy(fire_coords).float().to(self.device)  # (F, 2)
+        fuel_t = torch.from_numpy(fuel_coords).float().to(self.device)  # (M, 2)
+
+        # Batched pairwise distances — (M, F)
+        # torch.cdist handles this without an explicit loop
+        dists = torch.cdist(fuel_t, fire_t, p=2)           # (M, F)
+        nearest_dists, nearest_idxs = dists.min(dim=1)     # (M,)
+
+        in_radius = nearest_dists <= eval_radius
+        fuel_coords_f = fuel_t[in_radius]
+        nearest_dists = nearest_dists[in_radius]
+        nearest_idxs  = nearest_idxs[in_radius]
+
+        if fuel_coords_f.shape[0] == 0:
+            return np.zeros(fuel_map.shape, dtype=np.float32)
+
+        fuel_vals_t = torch.from_numpy(
+            fuel_map[fuel_coords[in_radius.cpu().numpy(), 0],
+                     fuel_coords[in_radius.cpu().numpy(), 1]]
+        ).float().to(self.device)
+
+        fire_vals_t = torch.from_numpy(
+            fire_map[fire_coords[nearest_idxs.cpu().numpy(), 0],
+                     fire_coords[nearest_idxs.cpu().numpy(), 1]]
+        ).float().to(self.device)
+
+        risks = torch.clamp(
+            (fuel_vals_t + fire_vals_t) / (nearest_dists * 2 + 1), 0.0, 1.0
+        )
+
+        risk_map = np.zeros(fuel_map.shape, dtype=np.float32)
+        idx = in_radius.cpu().numpy()
+        risk_map[fuel_coords[idx, 0], fuel_coords[idx, 1]] = risks.cpu().numpy()
+        return risk_map
 
     def evaluate_risk_map_2(self, scene_obs, eval_radius=50):
         fuel_map = scene_obs[:, :, 0]
@@ -466,7 +517,7 @@ class MultiAgentEnv(gym.Env):
         penality_scale = 3
 
         prev_visited_frac = getattr(self, "_visited_frac", 0.0)
-        risk_map = self.evaluate_risk_map_2(scene_obs, eval_radius=100)
+        risk_map = self.evaluate_risk_map_gpu(scene_obs, eval_radius=100)
         total_reward, new_visited_frac = self.calculate_reward_2(
             scene_obs, risk_map, prev_visited_frac, deltas, self.recency_map
         )
