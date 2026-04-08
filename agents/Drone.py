@@ -14,7 +14,7 @@ import numpy as np
 class Drone:
     def __init__(self, id:str, pos:dict = None, neighbours:list = None,
                  p_const:float=0.1, i_const:float=0.1, d_const:float=0.,
-                 max_speed:float=20.0, damping:float=0.85):
+                 max_speed:float=50.0, damping:float=0.9):
         self.id = id
         self.neighbours = neighbours
         self.p_const = p_const

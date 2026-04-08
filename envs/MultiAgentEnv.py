@@ -24,6 +24,7 @@ class MultiAgentEnv(gym.Env):
             start_positions:list=None, 
             iter_limit=1500, 
             seed = None, 
+            fixed_seed=False,
             env_id="MultiAgentEnv", 
             render_mode="human", 
             sample_interval=100, 
@@ -43,6 +44,7 @@ class MultiAgentEnv(gym.Env):
         self.env_id = env_id
         self.sample_int = sample_interval
         self.save_int = save_interval
+        self.fixed_seed = fixed_seed
 
         self._episode_count = 0
 
@@ -59,36 +61,10 @@ class MultiAgentEnv(gym.Env):
         self.vp_size = 64
         self.step_size = 1
 
-        # sort of flattening the multi agent space into a 1D single agent space.
-        # TODO : Encoder can make it input shape agnostic
         self.actions_per_agent = 2
         self.n_actions = self.n_agents * self.actions_per_agent
-        # self.action_space = gym.spaces.Box(
-        #     low=0,
-        #     high=2,
-        #     shape=(self.n_agents * 2,),
-        #     dtype=np.uint8
-        # )
 
         self.action_space = gym.spaces.MultiDiscrete([3] * (self.n_agents * 2))
-
-
-        # once again, flattening the multi agent observations into a single world level observation.
-        # TODO: Encoder should once again make it shape agnostic
-
-        # self.observation_space = gym.spaces.Dict({
-        #     "viewport": gym.spaces.Box(
-        #         low=0.0, high=1.0,
-        #         shape=(2, self.world_size[0], self.world_size[1]),  # CHW
-        #         dtype=np.float32
-        #     ),
-        #     "positions": gym.spaces.Box(
-        #         low=0,
-        #         high=max(self.world_size),
-        #         shape=(self.n_agents * 2,),
-        #         dtype=np.int32
-        #     )
-        # })
 
         self.observation_space = gym.spaces.Dict({
             "viewport": gym.spaces.Box(low=0.0, high=1.0, shape=(3, 84, 84), dtype=np.float32),
@@ -111,6 +87,7 @@ class MultiAgentEnv(gym.Env):
         self._step_count = 0
 
         self.recency_map = None
+        self.fire_disc_map = None
 
         # render states
         self._fig = None
@@ -140,12 +117,8 @@ class MultiAgentEnv(gym.Env):
         fuel_view, recently_visited_fuel, delta_fuel_mask = Viewpoint.get_square_viewpoint_and_mark_visited(self.map[:, :, 0], self.visited_map, (x, y), size=self.vp_size)
         fire_view, recently_visited_fire, delta_fire_mask = Viewpoint.get_square_viewpoint_and_mark_visited(self.map[:, :, 1], self.visited_map, (x, y), size=self.vp_size)
         self.visited_map = recently_visited_fuel
-
         view, deltas = np.zeros((self.vp_size, self.vp_size, 2), dtype=np.float32), np.zeros((self.vp_size, self.vp_size, 2), dtype=np.float32)
         view[:, :, 0], view[:, :, 1] = fuel_view, fire_view
-
-        #print(f"Delta fuel shape : {delta_fuel_mask.shape} | View shape : {fuel_view.shape}")
-
         deltas[:, :, 0], deltas[:, :, 1] = delta_fuel_mask, delta_fire_mask
         return view, deltas
 
@@ -156,11 +129,11 @@ class MultiAgentEnv(gym.Env):
         self._step_count = 0
         self._episode_count += 1
         self._visited_frac = 0.0
-        if self.seed is not None and self._episode_count > 10:
-            if self._episode_count - 1 < 200:
+        if not self.fixed_seed and self.seed is not None and self._episode_count > 10:
+            if self._episode_count - 1 < 100:
                 self.map = self.world_gen.create_map(0.001, 0.003, seed=self.seed)
-            elif self._episode_count - 1 < 500:
-                if self._episode_count - 1 % 20 == 0:
+            elif self._episode_count - 1 < 200:
+                if self._episode_count - 1 % 10 == 0:
                     self.seed+=1
                 self.map = self.world_gen.create_map(0.001, 0.003, seed = self.seed)
             else:
@@ -169,6 +142,7 @@ class MultiAgentEnv(gym.Env):
             self.map = self.world_gen.create_map(0.001, 0.003, seed=self.seed)
         self.visited_map = np.zeros(self.world_size, dtype=np.bool)
         self.recency_map = np.zeros(self.world_size, dtype=np.float32)
+        self.fire_disc_map = np.full(self.world_size, -1, dtype=np.int32)
         self.view_acc.reset()
         
         self.agents = [f"agent_{i}" for i in range(self.n_agents)]
@@ -233,51 +207,39 @@ class MultiAgentEnv(gym.Env):
         risk_map[fuel_coords[:, 0], fuel_coords[:, 1]] = risks
 
         return risk_map
-
-    def calculate_reward(self, scene_obs, risk_map, prev_visited_frac):
+    
+    def _fire_discovery_reward(self, delta_views) -> float:
         """
-        Reward strategy:
-        - Always reward exploration (new area coverage).
-        - If no fire detected yet: pure exploration reward.
-        - If fire detected:
-            - Reward coverage of fire pixels (finding more fire).
-            - Reward coverage of high-risk fuel pixels.
-            - Small continued exploration bonus to keep agents moving.
-        - Penalty for boundary violations (handled in step() via penalty arg).
-
-        Returns (total_reward, new_visited_frac)
+        Returns a temporally discounted reward for newly discovered fire pixels.
+        Earlier discoveries yield higher reward.
         """
-        fuel_map  = scene_obs[:, :, 0]
-        fire_map  = scene_obs[:, :, 1]
+        total = 0.0
+        # discount factor: reward at step 0 = max_fire_reward, 
+        # at step iter_limit approaches min_fire_reward
+        max_reward = 10.0
+        min_reward = 1.0
+        decay = np.log(max_reward / min_reward) / self.iter_limit
+        # at step t: multiplier = max_reward * exp(-decay * t)
+        time_multiplier = max_reward * np.exp(-decay * self._step_count)
 
-        total_pixels   = scene_obs.shape[0] * scene_obs.shape[1]
-        visited_mask   = (fuel_map > 0) | (fire_map > 0)   # any nonzero = visited
-        visited_frac   = np.sum(visited_mask) / total_pixels
+        for delta, pos in zip(delta_views, self._agent_positions):
+            px, py = pos
+            half = self.vp_size // 2
+            x0 = np.clip(px - half, 0, self.world_size[0])
+            x1 = np.clip(px + half, 0, self.world_size[0])
+            y0 = np.clip(py - half, 0, self.world_size[1])
+            y1 = np.clip(py + half, 0, self.world_size[1])
+            h, w = x1 - x0, y1 - y0
 
-        # --- exploration reward: delta coverage since last step ---
-        exploration_reward = (visited_frac - prev_visited_frac) * 10
+            new_fire = delta[:h, :w, 1] > 0
+            undiscovered = self.fire_disc_map[x0:x1, y0:y1] == -1
 
-        fire_detected = np.any(fire_map > 0)
+            n_new = np.sum(new_fire & undiscovered)
+            if n_new > 0:
+                normalised = n_new / (self.vp_size ** 2)
+                total += normalised * time_multiplier
 
-        if not fire_detected:
-            # pure exploration phase
-            total_reward = exploration_reward
-            return total_reward, visited_frac
-
-        # --- fire coverage reward: fraction of fire pixels in view ---
-        fire_pixels_visible = np.sum(fire_map > 0)
-        fire_coverage_reward = (fire_pixels_visible / (self.vp_size * self.vp_size)) * 10.0
-
-        # --- risk reward: mean risk score over visible high-risk fuel ---
-        high_risk_mask  = risk_map > 0.5
-        if np.any(high_risk_mask):
-            risk_reward = np.mean(risk_map[high_risk_mask]) * 1.50
-        else:
-            risk_reward = 0.0
-
-        # exploration bonus persists so agents keep searching for more fire
-        total_reward = exploration_reward + fire_coverage_reward + risk_reward
-        return total_reward, visited_frac
+        return total
     
     def calculate_reward_2(self, scene_obs, risk_map, prev_visited_frac, delta_views, recency_map):
         new_fuel_pixels = sum(np.sum(d[:, :, 0] > 0) for d in delta_views)
@@ -285,6 +247,12 @@ class MultiAgentEnv(gym.Env):
 
         exploration_reward = (new_fuel_pixels / (self.vp_size * self.vp_size * self.n_agents)) * 2.0
         fire_discovery_reward = (new_fire_pixels / (self.vp_size * self.vp_size * self.n_agents)) * 100.0
+
+        fire_coverage = 1 + (np.sum(scene_obs[:, :, 1]) / np.sum(self.map[:, :, 1]))
+
+        step_advantage = 1.4 * (1 + (1 - GenericUtils.normalize_data(self._step_count, 0, self.iter_limit)))
+
+        #print(f"STEP {self._step_count} | ADV FACTOR {step_advantage}")
 
         fuel_risk_reward = 0.0
         revisit_penalty = 0.0
@@ -309,7 +277,7 @@ class MultiAgentEnv(gym.Env):
         total_visited = np.sum(self.visited_map)
         total_cells   = self.world_size[0] * self.world_size[1]
         coverage_bonus = (total_visited / total_cells) * 3.0
-        return exploration_reward + fire_discovery_reward + fuel_risk_reward + revisit_penalty, prev_visited_frac + coverage_bonus
+        return exploration_reward + (step_advantage * fire_discovery_reward) + fuel_risk_reward + revisit_penalty, prev_visited_frac + coverage_bonus
     
     def evaluate_risk_map(self, map):
         """
@@ -441,27 +409,13 @@ class MultiAgentEnv(gym.Env):
             nb_penality += self.calculate_near_boundary_penalty(px, py)
             view_recency = self.mark_recency_map(px, py)
 
-            # if px >= self.world_size[0] or px < 0 or py >= self.world_size[1] or py <= 0:
-            #     #print(f"Agent {self.agents[i]} hit bounds")
-            #     self._agent_positions[i] = (px, py)
-            #     loc_pos_history.append((px - dx, py - dx))
-            #     loc_view_history.append(np.zeros((self.vp_size, self.vp_size, 2), dtype=np.float32))
-            #     penality+=1
-
-            #     continue
             if px >= self.world_size[0] or px < 0 or py >= self.world_size[1] or py < 0:
                 px = np.clip(px, 0, self.world_size[0] - 1)
                 py = np.clip(py, 0, self.world_size[1] - 1)
                 self._agent_positions[i] = (px, py)
                 agent.set_position({'x': px, 'y': py, 'z': 0})  # zero out accumulated velocity
-                penality += 10   # much heavier than your current 1
-                # don't terminate, don't continue — still extract view from clamped pos
-
-                # loc_pos_history.append((px, py - dx))
-                # loc_view_history.append(np.zeros((self.vp_size, self.vp_size, 2), dtype=np.float32))
+                penality += 10 
                 is_oob = True
-                #terminated=True
-                #continue
             
 
             view, delta_view = self.extract_viewpoint(px, py)
@@ -487,8 +441,25 @@ class MultiAgentEnv(gym.Env):
             loc_pos_history.append((px, py))
             loc_view_history.append(delta_view)
 
-        if penality == self.n_agents:
-            terminated=True
+        
+        for delta, pos in zip(deltas, self._agent_positions):
+            px, py = pos
+            half = self.vp_size // 2
+            x0 = np.clip(px - half, 0, self.world_size[0])
+            x1 = np.clip(px + half, 0, self.world_size[0])
+            y0 = np.clip(py - half, 0, self.world_size[1])
+            y1 = np.clip(py + half, 0, self.world_size[1])
+
+            h = x1 - x0
+            w = y1 - y0
+
+            # delta[:, :, 1] is the fire delta — newly seen fire pixels this step
+            new_fire_mask = delta[:h, :w, 1] > 0
+            # only stamp pixels not yet discovered
+            undiscovered = self.fire_disc_map[x0:x1, y0:y1] == -1
+            stamp_mask = new_fire_mask & undiscovered
+            self.fire_disc_map[x0:x1, y0:y1][stamp_mask] = self._step_count
+
 
         scene_obs = self.view_acc.get_scene()
 

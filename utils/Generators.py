@@ -140,7 +140,8 @@ class FuelMapGenerator:
             growth_rate=0.02,
             wind_strength=0.5,
             edge_sigma=1.0,
-            seed=None
+            seed=None,
+            num_regions=3
         ):
 
         if seed is not None:
@@ -149,7 +150,7 @@ class FuelMapGenerator:
         H, W = shape
 
         # base field
-        field = self.generate_fire_field_clustered(shape, seed=seed)
+        field = self.generate_fire_field_clustered(shape, seed=seed, num_regions=num_regions)
 
         # wind
         wx, wy = self.generate_wind_field(shape, seed=seed)
@@ -284,7 +285,7 @@ class FuelMapGenerator:
 
         world_map = np.zeros((self.size[0], self.size[0], 2), dtype=np.float32)
 
-        fire_masks, wind_vectors = self.generate_fire_perimeter_timeseries(self.size, 3, width_mean=5, fronts_per_step=5, edge_sigma=0.1, growth_rate=0.03, wind_strength=1.0, seed=seed)
+        fire_masks, wind_vectors = self.generate_fire_perimeter_timeseries(self.size, 1, width_mean=2, fronts_per_step=10, edge_sigma=0.5, growth_rate=0.03, wind_strength=1.0, seed=seed, num_regions=3)
         fire_mask = fire_masks[0]
         
         w = 0.7

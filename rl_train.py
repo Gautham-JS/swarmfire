@@ -7,7 +7,8 @@ from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
 from stable_baselines3.common.callbacks import BaseCallback
 
 
-
+import torch.nn as nn
+from stable_baselines3.common.callbacks import CheckpointCallback, EvalCallback
 
 
 class MemoryResetCallback(BaseCallback):
@@ -18,6 +19,34 @@ class MemoryResetCallback(BaseCallback):
                 policy = self.model.policy
                 policy.features_extractor.reset_memory()
         return True
+
+
+
+checkpoint_cb = CheckpointCallback(
+    save_freq=50_000,            # save every 50k timesteps
+    save_path="./checkpoints/",
+    name_prefix="drone_ppo",
+    save_vecnormalize=True,      # saves the VecNormalize stats too
+)
+
+# Separate eval env to measure true performance without exploration noise
+eval_env = DummyVecEnv([lambda: MultiAgentEnv(
+    n_agents=4,
+    world_size=(512, 512),
+    start_positions=[(128, 128), (256, 128), (128, 256), (256, 256)],
+    render_mode="human",
+    sample_interval=999999,      # suppress rendering during eval
+)])
+eval_env = VecNormalize(eval_env, norm_obs=False, norm_reward=False, training=False)
+
+eval_cb = EvalCallback(
+    eval_env,
+    best_model_save_path="./best_model/",
+    log_path="./logs/",
+    eval_freq=50_000,            # evaluate every 50k timesteps
+    n_eval_episodes=10,          # average over 10 episodes
+    deterministic=True,          # no exploration during eval
+)
 
 
 env = DummyVecEnv(
@@ -40,13 +69,6 @@ env = DummyVecEnv(
 env = VecNormalize(env, norm_obs=False, norm_reward=True, clip_reward=10.0)
 
 
-
-
-
-
-
-import torch.nn as nn
-from stable_baselines3.common.policies import ActorCriticPolicy
 
 resnet_policy_kwargs = dict(
     features_extractor_class = ResNetActorCriticModel.FireScoutExtractor,
@@ -92,72 +114,10 @@ model = PPO(
 )
 
 
-# model = PPO(
-#     "MultiInputPolicy", env,
-#     policy_kwargs=dict(
-#         features_extractor_class=SpatialTransformerModel.SpatialTransformerExtractor,
-#         features_extractor_kwargs=dict(
-#             features_dim=256,
-#             n_heads=4,
-#             n_layers=2,
-#         ),
-#         net_arch=dict(pi=[128, 64], vf=[128, 64]),
-#     ),
-#     verbose=1,
-#     learning_rate=3e-4,
-#     batch_size=256,
-#     n_steps=2048,
-#     n_epochs=10,
-#     gamma=0.99,
-#     gae_lambda=0.95,
-#     ent_coef=0.05,
-#     vf_coef=0.5,
-#     max_grad_norm=0.5,
-#     clip_range=0.2,
-# )
 
 
-
-
-
-
-
-# model = PPO(
-#     "MultiInputPolicy", env,
-#     verbose=1,
-#     learning_rate=1e-4,          # lower — reward scale is high
-#     batch_size=256,
-#     n_steps=2048,                # ~20 full episodes per rollout
-#     n_epochs=10,
-#     gamma=0.99,
-#     gae_lambda=0.95,
-#     ent_coef=0.05,               # higher entropy to fight premature convergence
-#     vf_coef=0.5,
-#     max_grad_norm=0.5,
-#     clip_range=0.2
-# )
-
-
-
-model.learn(total_timesteps=500_000, callback=MemoryResetCallback())
+model.learn(total_timesteps=5_000_000, callback=MemoryResetCallback())
 model.save("./single_agent_xformer.zip")
-
-# for episode in range(10):
-#     obs, _ = env.reset()
-#     episode_reward = 0.0
-#     is_exit = False
-#     terminated = False
-
-#     while not terminated or not is_exit:  # PettingZoo: loop until no agents remain
-#         actions = env.action_space.sample()
-#         obs, rewards, terminated, truncated, infos = env.step(actions)
-#         episode_reward += rewards
-#         frame = env.render()
-    
-#     if is_exit:
-#         break
-
-#     print(f"Episode {episode} | rewards: {episode_reward}")
 
 
 
