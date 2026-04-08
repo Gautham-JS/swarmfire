@@ -167,9 +167,6 @@ model = PPO(
 
 
 if __name__ == "__main__":
-    N_ENVS = 4
-
-    env = SubprocVecEnv([make_env(i) for i in range(N_ENVS)])
     env = VecNormalize(env, norm_obs=False, norm_reward=True, clip_reward=10.0)
 
     model = PPO(
@@ -190,6 +187,7 @@ if __name__ == "__main__":
     model.learn(total_timesteps=5_000_000, callback=MemoryResetCallback())
     model.save("./checkpoints/final_model")
     env.close()
+
 
 
 
