@@ -32,7 +32,8 @@ class MultiAgentEnv(gym.Env):
             save_interval=500, 
             is_vid_out=False, 
             vid_base_path = "./vids/", 
-            vid_id="test_"
+            vid_id="test_",
+            phase_weights:dict = None
         ):
         super().__init__()
 
@@ -55,10 +56,7 @@ class MultiAgentEnv(gym.Env):
         self._recency_visit_bump = 1.0  # value stamped on visit
 
         # reward fn weights
-        self._r_fire_wt = 5.0
-        self._r_fuel_wt = 2.0
-        self._r_oob_penality = -1.5
-        self._r_revisit_penality = -0.5
+        self.set_reward_weights(phase_weights)
 
 
         self.vp_size = 64
@@ -69,9 +67,10 @@ class MultiAgentEnv(gym.Env):
 
         self.action_space = gym.spaces.MultiDiscrete([3] * (self.n_agents * 2))
 
+        # n_agents * (x, y, vx, vy, fire_dx, fire_dy, fire_dist) = n_agents * 7
         self.observation_space = gym.spaces.Dict({
             "viewport": gym.spaces.Box(low=0.0, high=1.0, shape=(3, 84, 84), dtype=np.float32),
-            "positions": gym.spaces.Box(low=0.0, high=1.0, shape=(self.n_agents * 2,), dtype=np.float32)
+            "positions": gym.spaces.Box(low=-1.0, high=1.0, shape=(self.n_agents * 7,), dtype=np.float32)
         })
 
         self.world_gen = Generators.FuelMapGenerator(self.world_size)
@@ -102,6 +101,14 @@ class MultiAgentEnv(gym.Env):
             self.vid_base_path = vid_base_path
             self.vid_id = vid_id
             self.fps = 30
+    
+    def set_reward_weights(self, weights: dict):
+        if weights is None:
+            weights = {}
+        self._w_exploration    = weights.get("exploration",    1.0)
+        self._w_fire_discovery = weights.get("fire_discovery", 1.0)
+        self._w_fire_tracking  = weights.get("fire_tracking",  1.0)
+        self._w_risk           = weights.get("risk",           1.0)
 
     def create_model_descriptor_dict(self):
         d = {}
@@ -168,6 +175,7 @@ class MultiAgentEnv(gym.Env):
         for p in self._agent_positions:
             pos.append(p[0])
             pos.append(p[1])
+        pos.extend([0, 0, 0, 0, 0])
         
         obs["positions"] = np.asarray(pos, dtype=np.float32) / max(self.world_size)
 
@@ -330,35 +338,101 @@ class MultiAgentEnv(gym.Env):
         coverage_bonus = (total_visited / total_cells) * 3.0
         return exploration_reward + (step_advantage * fire_discovery_reward) + fuel_risk_reward + revisit_penalty, prev_visited_frac + coverage_bonus
     
-    def evaluate_risk_map(self, map):
+    def calculate_reward(self, scene_obs, risk_map, prev_visited_frac, delta_views, recency_map):
+        step_advantage = 1.4 * (1 + (1 - GenericUtils.normalize_data(self._step_count, 0, self.iter_limit)))
+
+        new_fuel_pixels = sum(np.sum(d[:, :, 0] > 0) for d in delta_views)
+        new_fire_pixels = sum(np.sum(d[:, :, 1] > 0) for d in delta_views)
+
+        exploration_reward = (new_fuel_pixels / (self.vp_size * self.vp_size * self.n_agents)) * 2.0
+        fire_discovery_reward = (new_fire_pixels / (self.vp_size * self.vp_size * self.n_agents)) * 100.0
+
+        fuel_risk_reward = 0.0
+        revisit_penalty = 0.0
+
+        for delta, pos in zip(delta_views, self._agent_positions):
+            px, py = pos
+            half = self.vp_size // 2
+            x0 = np.clip(px - half, 0, self.world_size[0])
+            x1 = np.clip(px + half, 0, self.world_size[0])
+            y0 = np.clip(py - half, 0, self.world_size[1])
+            y1 = np.clip(py + half, 0, self.world_size[1])
+
+            risk_patch = risk_map[x0:x1, y0:y1]
+            h, w = risk_patch.shape
+            delta_fuel = delta[:h, :w, 0]
+            fuel_risk_reward += float(np.sum(delta_fuel * risk_patch)) / (self.vp_size ** 2) * 5
+
+            # revisit penalty: mean recency heat under this agent's footprint
+            recency_patch = recency_map[x0:x1, y0:y1]
+            revisit_penalty += float(np.mean(recency_patch)) * -0.5  # _r_revisit_penality is negative
+
+        total_visited = np.sum(self.visited_map)
+        total_cells   = self.world_size[0] * self.world_size[1]
+        coverage_bonus = (total_visited / total_cells) * 3.0
+
+        fire_boundary_rew = self._fire_boundary_tracking_reward(delta_views)
+        
+        reward = 0
+        reward += self._w_fire_tracking * fire_boundary_rew
+        reward += self._w_exploration * exploration_reward
+        reward += self._w_fire_discovery * (step_advantage * fire_discovery_reward)
+        reward += self._w_risk * fuel_risk_reward
+        reward += revisit_penalty
+
+        return reward, prev_visited_frac + coverage_bonus
+    
+
+    def _fire_boundary_tracking_reward(self, delta_views) -> float:
         """
-            Sort of the heart of the logic
-
-            2 key layers:
-                fuel_map: map[:, :, 0]
-                fire_map: map[:, :, 1]
-            
-            key functions needed:
-                sample_fire_idxs(fire) -> np.ndarray of shape (Nx2), coordinates of each fire sample. Resolution could be chosen too ig.
-                    -> sample fire map as grids
-                    -> for each patch:
-                        -> if mask activation exists:
-                            -> calculate centroid of the detection in patch
-                            -> transform centroid to world map coordinates\
-                            -> store centroid coord as fire sample
-
-                sort_fuels_by_risk(fire_samples, fuels_map, eval_radius) -> np.ndarray of same size as map, with pixel values having range 0-1 representing risk of that fuel.:
-                    -> for each fire sample,
-                        -> extract a radius around the point.
-                        -> for each fuel coordinate in that radius:
-                            -> if nonzero value:
-                                -> d = eucledian_dist(fuel_coord, fire_coord)
-                                -> fuel_val, fire_val = fuel_map[fuel_coord], fire_map[fire_coord]
-                                -> risk = (1/d+1) * (fuel_val + fire_val)
-
-
-
+        Rewards agents whose velocity aligns with the local fire boundary direction.
+        If fire occupies a horizontal edge in the viewport, moving horizontally is rewarded.
         """
+        total = 0.0
+        for i, (delta, pos) in enumerate(zip(delta_views, self._agent_positions)):
+            px, py = pos
+            half = self.vp_size // 2
+            x0 = np.clip(px - half, 0, self.world_size[0])
+            x1 = np.clip(px + half, 0, self.world_size[0])
+            y0 = np.clip(py - half, 0, self.world_size[1])
+            y1 = np.clip(py + half, 0, self.world_size[1])
+
+            fire_patch = self.map[x0:x1, y0:y1, 1]
+            if not np.any(fire_patch > 0):
+                continue
+
+            # Compute fire boundary normal using Sobel gradient
+            from scipy.ndimage import sobel
+            gx = sobel(fire_patch, axis=1)
+            gy = sobel(fire_patch, axis=0)
+
+            # Mean gradient direction at the boundary
+            mag = np.sqrt(gx**2 + gy**2)
+            if mag.sum() < 1e-6:
+                continue
+            boundary_normal = np.array([
+                np.sum(gy * mag) / mag.sum(),
+                np.sum(gx * mag) / mag.sum()
+            ])
+            boundary_normal /= (np.linalg.norm(boundary_normal) + 1e-8)
+
+            # Tangent to boundary = perpendicular to normal
+            boundary_tangent = np.array([-boundary_normal[1], boundary_normal[0]])
+
+            # Agent velocity direction this step
+            if len(self._pos_history) >= 2:
+                prev_pos = self._pos_history[-2][i]
+                curr_pos = self._pos_history[-1][i]
+                vel = np.array([curr_pos[0] - prev_pos[0],
+                                curr_pos[1] - prev_pos[1]], dtype=np.float32)
+                vel_norm = np.linalg.norm(vel)
+                if vel_norm > 1e-6:
+                    vel_dir = vel / vel_norm
+                    # Alignment with tangent — ranges [-1, 1], reward only positive
+                    alignment = float(np.dot(vel_dir, boundary_tangent))
+                    total += max(0.0, alignment) * 2.0
+
+        return total
     
     def calculate_per_agent_reward(self, delta_views, risk_map):
         rewards = []
@@ -428,6 +502,43 @@ class MultiAgentEnv(gym.Env):
         recency_resized = cv2.resize(recency_crop, (84, 84), interpolation=cv2.INTER_AREA)[None]  # (1, 84, 84)
 
         return np.concatenate([scene_chw, recency_resized], axis=0).astype(np.float32)  # (3, 84, 84)
+
+
+    def _build_positions_obs(self) -> np.ndarray:
+        obs = []
+        scene = self.view_acc.get_scene()
+        fire_coords = np.argwhere(scene[:, :, 1] > 0)
+
+        for i, pos in enumerate(self._agent_positions):
+            px, py = pos
+            # Normalised position
+            obs.append(px / self.world_size[0])
+            obs.append(py / self.world_size[1])
+
+            # Velocity (from last step)
+            if len(self._pos_history) >= 2:
+                prev = self._pos_history[-2][i]
+                vx = (px - prev[0]) / (self.step_size + 1e-8)
+                vy = (py - prev[1]) / (self.step_size + 1e-8)
+            else:
+                vx, vy = 0.0, 0.0
+            obs.append(np.clip(vx, -1, 1))
+            obs.append(np.clip(vy, -1, 1))
+
+            # Direction to nearest known fire (or zeros if none)
+            if len(fire_coords) > 0:
+                diffs = fire_coords - np.array([px, py])
+                dists = np.linalg.norm(diffs, axis=1)
+                nearest = diffs[np.argmin(dists)]
+                dist = dists.min()
+                fire_dir = nearest / (dist + 1e-8)
+                obs.append(float(np.clip(fire_dir[0], -1, 1)))
+                obs.append(float(np.clip(fire_dir[1], -1, 1)))
+                obs.append(float(np.clip(dist / max(self.world_size), 0, 1)))
+            else:
+                obs.extend([0.0, 0.0, 1.0])  # no fire known, max distance
+
+        return np.asarray(obs, dtype=np.float32)
 
     def step(self, action):
         reward, terminated, truncated, infos, obs = 0.0, False, False, {}, {}
@@ -518,7 +629,7 @@ class MultiAgentEnv(gym.Env):
 
         prev_visited_frac = getattr(self, "_visited_frac", 0.0)
         risk_map = self.evaluate_risk_map_gpu(scene_obs, eval_radius=100)
-        total_reward, new_visited_frac = self.calculate_reward_2(
+        total_reward, new_visited_frac = self.calculate_reward(
             scene_obs, risk_map, prev_visited_frac, deltas, self.recency_map
         )
         self._visited_frac = new_visited_frac
@@ -548,7 +659,7 @@ class MultiAgentEnv(gym.Env):
 
 
         obs["viewport"] = self.create_global_crop_viewport_obs()
-        obs["positions"] = np.asarray(poss, dtype=np.float32) / max(self.world_size)
+        obs["positions"] = self._build_positions_obs()
 
         if self._step_count > self.iter_limit:
             terminated = True

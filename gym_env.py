@@ -5,6 +5,8 @@ from policies import ResNetActorCriticModel, TemporalTransformerModel
 from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
 from stable_baselines3.common.callbacks import BaseCallback
+from stable_baselines3.common.callbacks import CheckpointCallback, EvalCallback
+
 
 
 
@@ -20,14 +22,50 @@ class MemoryResetCallback(BaseCallback):
         return True
 
 
+class TrainingMonitorCallback(BaseCallback):
+    def __init__(self, verbose=1):
+        super().__init__(verbose)
+        self.episode_count = 0
+        self.timestep_at_last_episode = 0
+
+    def _on_step(self):
+        # Count episodes from the done flags
+        for done in self.locals["dones"]:
+            if done:
+                self.episode_count += 1
+                steps_this_ep = self.num_timesteps - self.timestep_at_last_episode
+                self.timestep_at_last_episode = self.num_timesteps
+                if self.verbose and self.episode_count % 50 == 0:
+                    print(
+                        f"Episode {self.episode_count} | "
+                        f"Timestep {self.num_timesteps} | "
+                        f"Steps this ep: {steps_this_ep}"
+                    )
+        return True
+
+    def _on_training_end(self):
+        print(f"\nTraining ended after {self.episode_count} episodes "
+              f"and {self.num_timesteps} timesteps")
+
+
+# Separate eval env to measure true performance without exploration noise
+eval_env = DummyVecEnv([lambda: MultiAgentEnv(
+    n_agents=4,
+    world_size=(512, 512),
+    start_positions=[(128, 128), (256, 128), (128, 256), (256, 256)],
+    render_mode="human",
+    sample_interval=999999,      # suppress rendering during eval
+)])
+eval_env = VecNormalize(eval_env, norm_obs=False, norm_reward=False, training=False)
+
 env = DummyVecEnv(
     [lambda: MultiAgentEnv(
             n_agents=1,
             world_size=(512, 512),
             start_positions=[(256, 256), (256, 128), (128, 256), (256, 256)],  # fixed grid
             render_mode="human",
-            sample_interval=20,
-            save_interval=20,
+            sample_interval=100,
+            save_interval=100,
             seed=34,
             fixed_seed=False,
             is_vid_out=True,
@@ -138,26 +176,36 @@ model = PPO(
 # )
 
 
+memory_reset_cb = MemoryResetCallback()
+memory_reset_cb = MemoryResetCallback()
+monitor_cb      = TrainingMonitorCallback()
+eval_cb = EvalCallback(
+    eval_env,
+    best_model_save_path="./best_model/",
+    log_path="./logs/",
+    eval_freq=50_000,            # evaluate every 50k timesteps
+    n_eval_episodes=10,          # average over 10 episodes
+    deterministic=True,          # no exploration during eval
+)
+checkpoint_cb = CheckpointCallback(
+    save_freq=50_000,            # save every 50k timesteps
+    save_path="./checkpoints/",
+    name_prefix="drone_ppo",
+    save_vecnormalize=True,      # saves the VecNormalize stats too
+)
 
-model.learn(total_timesteps=500_000, callback=MemoryResetCallback())
+
+
+
+model.learn(
+    total_timesteps=5_000_000,
+    callback=[memory_reset_cb, monitor_cb, checkpoint_cb, eval_cb],
+    reset_num_timesteps=False,
+)
+
 model.save("./single_agent_xformer.zip")
 
-# for episode in range(10):
-#     obs, _ = env.reset()
-#     episode_reward = 0.0
-#     is_exit = False
-#     terminated = False
 
-#     while not terminated or not is_exit:  # PettingZoo: loop until no agents remain
-#         actions = env.action_space.sample()
-#         obs, rewards, terminated, truncated, infos = env.step(actions)
-#         episode_reward += rewards
-#         frame = env.render()
-    
-#     if is_exit:
-#         break
-
-#     print(f"Episode {episode} | rewards: {episode_reward}")
 
 
 
