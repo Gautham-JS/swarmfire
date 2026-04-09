@@ -9,7 +9,7 @@ from stable_baselines3.common.callbacks import CheckpointCallback, EvalCallback
 
 
 N_AGENTS=1
-
+N_STEPS=500
 
 
 
@@ -55,7 +55,8 @@ eval_env = DummyVecEnv([lambda: MultiAgentEnv(
     world_size=(512, 512),
     start_positions=[(128, 128), (256, 128), (128, 256), (256, 256)],
     render_mode="human",
-    sample_interval=999999,      # suppress rendering during eval
+    sample_interval=999999,      # suppress rendering during eval,
+    iter_limit=N_STEPS
 )])
 eval_env = VecNormalize(eval_env, norm_obs=False, norm_reward=False, training=False)
 
@@ -70,7 +71,7 @@ env = DummyVecEnv(
             seed=34,
             fixed_seed=False,
             is_vid_out=True,
-            iter_limit=250,
+            iter_limit=N_STEPS,
             vid_id="no_swarming_global_reward",
             vid_base_path="/home/gjs/software/thesis/swarmfire/vids/"
         )

@@ -23,7 +23,7 @@ class MultiAgentEnv(gym.Env):
             n_agents, 
             world_size, 
             start_positions:list=None, 
-            iter_limit=1500, 
+            iter_limit=4500, 
             seed = None, 
             fixed_seed=False,
             env_id="MultiAgentEnv", 
@@ -109,6 +109,8 @@ class MultiAgentEnv(gym.Env):
         self._w_fire_discovery = weights.get("fire_discovery", 1.0)
         self._w_fire_tracking  = weights.get("fire_tracking",  1.0)
         self._w_risk           = weights.get("risk",           1.0)
+
+        print(f"[REWARD_WEIGHTS_UPDATE] -> exploration : {self._w_exploration} | fire discovery : {self._w_fire_discovery} | fire tracking : {self._w_fire_tracking} | risk : {self._w_risk}")
 
     def create_model_descriptor_dict(self):
         d = {}
@@ -681,7 +683,7 @@ class MultiAgentEnv(gym.Env):
         #print(f"[STEP] POSITION : {obs['positions']}")
 
         if self._step_count > self.iter_limit:
-            terminated = True
+            truncated = True
         self._last_global_vp = obs["viewport"].copy()
 
         return obs, total_reward, terminated, truncated, infos
