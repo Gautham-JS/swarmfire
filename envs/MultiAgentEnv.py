@@ -132,57 +132,74 @@ class MultiAgentEnv(gym.Env):
         deltas[:, :, 0], deltas[:, :, 1] = delta_fuel_mask, delta_fire_mask
         return view, deltas
 
-    def reset(self, seed = None, options = None):
-        self.close()
-        self._obs_hsitory, self._agent_positions, self._reward_history, self._view_history, self._pos_history = [], [], [], [], []
-        
-        self._step_count = 0
-        self._episode_count += 1
-        self._visited_frac = 0.0
-        if not self.fixed_seed and self.seed is not None and self._episode_count > 10:
-            if self._episode_count - 1 < 100:
-                self.map = self.world_gen.create_map(0.001, 0.003, seed=self.seed)
-            elif self._episode_count - 1 < 200:
-                if self._episode_count - 1 % 10 == 0:
-                    self.seed+=1
-                self.map = self.world_gen.create_map(0.001, 0.003, seed = self.seed)
-            else:
-                self.map = self.world_gen.create_map(0.001, 0.003, seed = None)
-        else:
-            self.map = self.world_gen.create_map(0.001, 0.003, seed=self.seed)
-        self.visited_map = np.zeros(self.world_size, dtype=np.bool)
-        self.recency_map = np.zeros(self.world_size, dtype=np.float32)
+    def reset(self, seed=None, options=None):
+        # Clear episode state without destroying the video writer or figure
+        self._obs_hsitory    = []
+        self._agent_positions = []
+        self._reward_history  = []
+        self._view_history    = []
+        self._pos_history     = []
+        self._step_count      = 0
+        self._episode_count  += 1
+        self._visited_frac    = 0.0
+        self._last_global_vp  = None
+
+        # Reset maps
+        self.visited_map   = np.zeros(self.world_size, dtype=np.bool_)
+        self.recency_map   = np.zeros(self.world_size, dtype=np.float32)
         self.fire_disc_map = np.full(self.world_size, -1, dtype=np.int32)
         self.view_acc.reset()
-        
+
+        # Generate map
+        if not self.fixed_seed and self.seed is not None and self._episode_count > 10:
+            if (self._episode_count - 1) < 100:
+                self.map = self.world_gen.create_map(0.001, 0.003, seed=self.seed)
+            elif self._episode_count - 1 < 200:
+                if (self._episode_count - 1) % 10 == 0:
+                    self.seed += 1
+                self.map = self.world_gen.create_map(0.001, 0.003, seed=self.seed)
+            else:
+                self.map = self.world_gen.create_map(0.001, 0.003, seed=None)
+        else:
+            self.map = self.world_gen.create_map(0.001, 0.003, seed=self.seed)
+
+        # Spawn agents
         self.agents = [f"agent_{i}" for i in range(self.n_agents)]
         self.agent_instances = [Drone.Drone(f"agent_{i}") for i in range(self.n_agents)]
 
-        if self.start_poss is None:
-            self._agent_positions = [(np.random.randint(0, self.world_size[0]), np.random.randint(0, self.world_size[1])) for _ in range(self.n_agents)]
+        fire_coords = np.argwhere(self.map[:, :, 1] > 0)
+        if len(fire_coords) > 0 and self._episode_count < 300:
+            scatter = self.vp_size * 3
+            self._agent_positions = []
+            for _ in range(self.n_agents):
+                centre = fire_coords[np.random.randint(len(fire_coords))]
+                px = int(np.clip(centre[0] + np.random.randint(-scatter, scatter), 0, self.world_size[0] - 1))
+                py = int(np.clip(centre[1] + np.random.randint(-scatter, scatter), 0, self.world_size[1] - 1))
+                self._agent_positions.append((px, py))
+        elif self.start_poss is not None:
+            self._agent_positions = self.start_poss[:self.n_agents]
         else:
-            self._agent_positions = [(128, 128), (256, 128), (128, 256), (256, 256)][:self.n_agents]
+            self._agent_positions = [
+                (np.random.randint(0, self.world_size[0]),
+                np.random.randint(0, self.world_size[1]))
+                for _ in range(self.n_agents)
+            ]
 
         for p, a in zip(self._agent_positions, self.agent_instances):
-            a.set_position({'x':p[0], 'y':p[1], 'z':0})
+            a.set_position({'x': p[0], 'y': p[1], 'z': 0})
 
+        # Seed pos_history so _build_positions_obs has something to diff on step 1
+        self._pos_history = [list(self._agent_positions)]
 
-        self._last_global_vp = None
-        obs = {}
-        obs["viewport"] = np.zeros((3, 84, 84), dtype=np.float32)
-        
-        pos = []
-        for p in self._agent_positions:
-            pos.append(p[0])
-            pos.append(p[1])
-        pos.extend([0, 0, 0, 0, 0])
-        
-        obs["positions"] = np.asarray(pos, dtype=np.float32) / max(self.world_size)
+        obs = {
+            "viewport":  np.zeros((3, 84, 84), dtype=np.float32),
+            "positions": self._build_positions_obs(),
+        }
 
-        infos = {}
-        print(f"[RESET] : Starting episode {self._episode_count}")
-        #print(obs)
-        return obs, infos
+        if self._episode_count % 50 == 0:
+            print(f"[RESET] Episode {self._episode_count}")
+
+        return obs, {}
 
     def evaluate_risk_map_gpu(self, scene_obs, eval_radius=100):
         fuel_map = scene_obs[:, :, 0]
@@ -660,6 +677,8 @@ class MultiAgentEnv(gym.Env):
 
         obs["viewport"] = self.create_global_crop_viewport_obs()
         obs["positions"] = self._build_positions_obs()
+
+        #print(f"[STEP] POSITION : {obs['positions']}")
 
         if self._step_count > self.iter_limit:
             terminated = True
