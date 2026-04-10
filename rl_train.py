@@ -1,7 +1,8 @@
 from envs.MultiAgentEnv import MultiAgentEnv
-from policies import TemporalTransformerModel
+from policies import TemporalTransformerModel, CnnModel 
 
 from stable_baselines3 import PPO
+from sb3_contrib import RecurrentPPO
 from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
 from stable_baselines3.common.callbacks import (
     BaseCallback, CheckpointCallback, EvalCallback
@@ -252,7 +253,7 @@ def make_env(rank, is_eval=False):
             world_size=WORLD_SIZE,
             start_positions=[(256, 256)],
             render_mode="human" if (rank == 0 and not is_eval) else "rgb_array",
-            sample_interval=100  if (rank == 0 and not is_eval) else 999999,
+            sample_interval=20  if (rank == 0 and not is_eval) else 999999,
             save_interval=100   if (rank == 0 and not is_eval) else 999999,
             seed=34,
             fixed_seed=False,
@@ -300,34 +301,31 @@ if __name__ == "__main__":
         raise ValueError(f"Unknown curriculum: {CURRICULUM}")
 
     # Model
-    model = PPO(
-        "MultiInputPolicy",
+
+    model = RecurrentPPO(
+        "MultiInputLstmPolicy",
         train_env,
         policy_kwargs=dict(
-            features_extractor_class=TemporalTransformerModel.TemporalTransformerExtractor,
-            features_extractor_kwargs=dict(
-                features_dim=256,
-                n_heads=4,
-                n_layers=3,
-                memory_len=8,
-                n_envs=N_ENVS,
-            ),
+            features_extractor_class=CnnModel.PlainCNNExtractor,
+            features_extractor_kwargs=dict(features_dim=256),
+            lstm_hidden_size=256,
+            n_lstm_layers=1,
+            shared_lstm=False,        # separate LSTM for actor and critic
+            enable_critic_lstm=True,
+            normalize_images=False,
         ),
         verbose=1,
         learning_rate=3e-4,
+        n_steps=512,              # steps per env per rollout
         batch_size=256,
-        n_steps=2048,
         n_epochs=10,
         gamma=0.99,
         gae_lambda=0.95,
-        ent_coef=0.10,       # high entropy early — curriculum will tighten task
-        vf_coef=0.5,
+        ent_coef=0.05,
         max_grad_norm=0.5,
-        clip_range=0.2,
     )
 
     callbacks = [
-        MemoryResetCallback(),
         TrainingMonitorCallback(verbose=1),
         curriculum_cb,
         CheckpointCallback(
