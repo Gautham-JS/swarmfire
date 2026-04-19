@@ -1,4 +1,5 @@
 from envs.MultiAgentEnv import MultiAgentEnv
+from envs.SingleAgentEnv import SingleAgentEnv
 from policies import TemporalTransformerModel, CnnModel 
 
 from stable_baselines3 import PPO
@@ -8,6 +9,16 @@ from stable_baselines3.common.callbacks import (
     BaseCallback, CheckpointCallback, EvalCallback
 )
 from gymnasium.wrappers import TimeLimit
+from wandb.integration.sb3 import WandbCallback
+
+from collections import deque
+
+import os
+import argparse
+import wandb
+WANDB_API_KEY = "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"
+os.environ['WANDB_API_KEY'] = WANDB_API_KEY
+
 
 import numpy as np
 import torch
@@ -220,6 +231,7 @@ class PerformanceGatedCurriculumCallback(BaseCallback):
                 and len(self._reward_buffer) >= self.window):
             mean_reward = np.mean(self._reward_buffer)
             next_threshold, _ = self.gates[self._phase + 1]
+            print(f"[ONSTEP] : Mean reward : {mean_reward}")
             # next_threshold here is the reward needed to advance
             # (reusing the tuple slot — see PERFORMANCE_GATES definition)
             current_gate_reward = self.gates[self._phase][0]
@@ -235,6 +247,316 @@ class PerformanceGatedCurriculumCallback(BaseCallback):
         return True
 
 
+
+
+
+
+import threading
+import matplotlib.pyplot as plt
+import matplotlib.gridspec as gridspec
+import numpy as np
+from collections import deque
+
+
+class LiveTrainingPlot(BaseCallback):
+    """
+    Plots policy loss, value loss, entropy, and mean reward in real time.
+    Runs the matplotlib figure in a background thread so training is never blocked.
+    """
+
+    def __init__(
+        self,
+        window: int = 200,        # rolling window for smoothing
+        update_freq: int = 100,   # update plot every N steps
+        save_path: str = None,    # optional: save figure to disk periodically
+        verbose: int = 0,
+    ):
+        super().__init__(verbose)
+        self.window      = window
+        self.update_freq = update_freq
+        self.save_path   = save_path
+
+        # Data buffers — deque auto-drops old entries
+        self.policy_losses  = deque(maxlen=5000)
+        self.value_losses   = deque(maxlen=5000)
+        self.entropies      = deque(maxlen=5000)
+        self.approx_kls     = deque(maxlen=5000)
+        self.ep_rewards     = deque(maxlen=500)
+        self.ep_lengths     = deque(maxlen=500)
+        self.timesteps      = deque(maxlen=5000)
+        self.ep_timesteps   = deque(maxlen=500)
+
+        self._current_ep_reward = 0.0
+        self._current_ep_len    = 0
+        self._last_plot_step    = 0
+
+        # Thread coordination
+        self._plot_data   = {}
+        self._data_lock   = threading.Lock()
+        self._stop_event  = threading.Event()
+        self._plot_thread = None
+
+    # ── Callback hooks ────────────────────────────────────────────────
+
+    def _on_training_start(self):
+        self._plot_thread = threading.Thread(
+            target=self._plot_worker, daemon=True
+        )
+        self._plot_thread.start()
+
+    def _on_step(self):
+        # Accumulate episode reward
+        rewards = self.locals.get("rewards", [])
+        dones   = self.locals.get("dones",   [])
+
+        for r, d in zip(rewards, dones):
+            self._current_ep_reward += float(r)
+            self._current_ep_len    += 1
+            if d:
+                with self._data_lock:
+                    self.ep_rewards.append(self._current_ep_reward)
+                    self.ep_lengths.append(self._current_ep_len)
+                    self.ep_timesteps.append(self.num_timesteps)
+                self._current_ep_reward = 0.0
+                self._current_ep_len    = 0
+
+        return True
+
+    def _on_rollout_end(self):
+        """Called after each PPO update — pull losses from the logger."""
+        logger = self.model.logger
+        if logger is None:
+            return
+
+        # SB3 stores these in the logger's name_to_value dict
+        kv = logger.name_to_value
+
+        t = self.num_timesteps
+        with self._data_lock:
+            self.timesteps.append(t)
+
+            pg  = kv.get("train/policy_gradient_loss", None)
+            vf  = kv.get("train/value_loss",           None)
+            ent = kv.get("train/entropy_loss",         None)
+            kl  = kv.get("train/approx_kl",            None)
+
+            if pg  is not None: self.policy_losses.append(float(pg))
+            if vf  is not None: self.value_losses.append(float(vf))
+            if ent is not None: self.entropies.append(float(ent))
+            if kl  is not None: self.approx_kls.append(float(kl))
+
+    def _on_training_end(self):
+        self._stop_event.set()
+        if self._plot_thread is not None:
+            self._plot_thread.join(timeout=5.0)
+        if self.save_path:
+            self._save_figure()
+
+    # ── Background plot worker ────────────────────────────────────────
+
+    def _plot_worker(self):
+        plt.ion()
+        fig = plt.figure(figsize=(14, 8), facecolor="#1a1a2e")
+        fig.canvas.manager.set_window_title("Training Monitor")
+
+        gs   = gridspec.GridSpec(
+            2, 3, figure=fig,
+            hspace=0.45, wspace=0.35,
+            left=0.07, right=0.97, top=0.92, bottom=0.08
+        )
+        ax_pg  = fig.add_subplot(gs[0, 0])
+        ax_vf  = fig.add_subplot(gs[0, 1])
+        ax_ent = fig.add_subplot(gs[0, 2])
+        ax_kl  = fig.add_subplot(gs[1, 0])
+        ax_rew = fig.add_subplot(gs[1, 1])
+        ax_len = fig.add_subplot(gs[1, 2])
+
+        axes_cfg = [
+            (ax_pg,  "Policy gradient loss",  "#5DCAA5"),
+            (ax_vf,  "Value loss",             "#7F77DD"),
+            (ax_ent, "Entropy loss",           "#EF9F27"),
+            (ax_kl,  "Approx KL",              "#F0997B"),
+            (ax_rew, "Episode reward",         "#85B7EB"),
+            (ax_len, "Episode length",         "#C0DD97"),
+        ]
+
+        for ax, title, _ in axes_cfg:
+            ax.set_facecolor("#0d0d1a")
+            ax.set_title(title, color="white", fontsize=9, pad=4)
+            ax.tick_params(colors="gray", labelsize=7)
+            for spine in ax.spines.values():
+                spine.set_edgecolor("#333")
+
+        fig.suptitle("Training monitor", color="white",
+                     fontsize=11, fontweight="500", y=0.97)
+        plt.show()
+
+        while not self._stop_event.is_set():
+            with self._data_lock:
+                pg_data  = list(self.policy_losses)
+                vf_data  = list(self.value_losses)
+                ent_data = list(self.entropies)
+                kl_data  = list(self.approx_kls)
+                rew_data = list(self.ep_rewards)
+                len_data = list(self.ep_lengths)
+                rew_t    = list(self.ep_timesteps)
+
+            datasets = [pg_data, vf_data, ent_data, kl_data, rew_data, len_data]
+
+            for (ax, title, color), data in zip(axes_cfg, datasets):
+                if len(data) < 2:
+                    continue
+                ax.cla()
+                ax.set_facecolor("#0d0d1a")
+                ax.set_title(title, color="white", fontsize=9, pad=4)
+                ax.tick_params(colors="gray", labelsize=7)
+                for spine in ax.spines.values():
+                    spine.set_edgecolor("#333")
+
+                x = np.arange(len(data))
+                y = np.array(data)
+
+                # Raw values in faded color
+                ax.plot(x, y, color=color, alpha=0.25, linewidth=0.8)
+
+                # Rolling mean
+                if len(y) >= self.window:
+                    kernel = np.ones(self.window) / self.window
+                    smooth = np.convolve(y, kernel, mode="valid")
+                    x_s    = x[self.window - 1:]
+                    ax.plot(x_s, smooth, color=color,
+                            linewidth=1.5, label=f"mean({self.window})")
+
+                # Latest value annotation
+                ax.text(
+                    0.98, 0.95, f"{y[-1]:.4f}",
+                    transform=ax.transAxes,
+                    ha="right", va="top",
+                    color=color, fontsize=8,
+                    bbox=dict(facecolor="#00000088",
+                              edgecolor="none", pad=2)
+                )
+
+            fig.suptitle(
+                f"Training monitor  —  {self.num_timesteps:,} steps",
+                color="white", fontsize=11, fontweight="500", y=0.97
+            )
+
+            fig.canvas.draw()
+            fig.canvas.flush_events()
+
+            # Save periodically if path given
+            if self.save_path and self.num_timesteps % 50_000 < 500:
+                self._fig_ref = fig
+                self._save_figure()
+
+            self._stop_event.wait(timeout=2.0)   # update every 2 seconds
+
+        plt.close(fig)
+
+    def _save_figure(self):
+        if hasattr(self, "_fig_ref") and self.save_path:
+            try:
+                self._fig_ref.savefig(
+                    self.save_path,
+                    facecolor="#1a1a2e",
+                    dpi=120,
+                    bbox_inches="tight"
+                )
+            except Exception:
+                pass
+
+
+class WandbLoggingCallback(BaseCallback):
+    """
+    Clean SB3 → Weights & Biass logger.
+
+    Logs:
+    - policy loss
+    - value loss
+    - entropy
+    - KL divergence
+    - episode reward
+    - episode length
+    - timesteps
+
+    No plotting, no threads, minimal overhead.
+    """
+
+    def __init__(self, verbose=0):
+        super().__init__(verbose)
+
+        self._current_ep_reward = 0.0
+        self._current_ep_len = 0
+        self.episode_rewards = deque(maxlen=100)
+
+    # ─────────────────────────────────────────────
+    # STEP: track episode stats
+    # ─────────────────────────────────────────────
+    def _on_step(self):
+        rewards = self.locals.get("rewards", [])
+        dones = self.locals.get("dones", [])
+
+        for r, d in zip(rewards, dones):
+            self._current_ep_reward += float(r)
+            self._current_ep_len += 1
+
+            if d:
+                self.episode_rewards.append(self._current_ep_reward)
+                mean_reward = sum(self.episode_rewards) / len(self.episode_rewards)
+
+
+                wandb.log({
+                    "episode/reward": self._current_ep_reward,
+                    "episode/length": self._current_ep_len,
+                    "episode/mean_reward_100_steps": mean_reward,
+                    "timesteps": self.num_timesteps,
+                })
+
+                self._current_ep_reward = 0.0
+                self._current_ep_len = 0
+
+        return True
+
+    # ─────────────────────────────────────────────
+    # ROLLOUT END: grab training losses
+    # ─────────────────────────────────────────────
+    def _on_rollout_end(self):
+        logger = self.model.logger
+        if logger is None:
+            return
+
+        kv = logger.name_to_value
+
+        log_dict = {
+            "timesteps": self.num_timesteps
+        }
+
+        # Pull SB3 internal metrics
+        mapping = {
+            "train/policy_gradient_loss": "loss/policy",
+            "train/value_loss": "loss/value",
+            "train/entropy_loss": "loss/entropy",
+            "train/approx_kl": "loss/approx_kl",
+            "train/clip_fraction": "train/clip_fraction",
+            "train/explained_variance": "train/explained_variance",
+        }
+
+        for sb3_key, wandb_key in mapping.items():
+            val = kv.get(sb3_key)
+            if val is not None:
+                log_dict[wandb_key] = float(val)
+
+        wandb.log(log_dict)
+
+    # ─────────────────────────────────────────────
+    # TRAINING END
+    # ─────────────────────────────────────────────
+    def _on_training_end(self):
+        wandb.finish()
+
+
+
 # ─────────────────────────────────────────────
 # Environment factory
 # ─────────────────────────────────────────────
@@ -248,21 +570,21 @@ CURRICULUM   = "performance"   # "hard" | "smooth" | "performance"
 
 def make_env(rank, is_eval=False):
     def _init():
-        env = MultiAgentEnv(
+        env = SingleAgentEnv(
             n_agents=N_AGENTS,
             world_size=WORLD_SIZE,
             start_positions=[(256, 256)],
             render_mode="human" if (rank == 0 and not is_eval) else "rgb_array",
-            sample_interval=20  if (rank == 0 and not is_eval) else 999999,
-            save_interval=100   if (rank == 0 and not is_eval) else 999999,
+            sample_interval=50  if (rank == 0 and not is_eval) else 999999,
+            save_interval=50   if (rank == 0 and not is_eval) else 999999,
             seed=34,
             fixed_seed=False,
             is_vid_out=(rank == 0 and not is_eval),
             vid_id="firescout_smooth",
-            vid_base_path="./vids/",
+            vid_base_path="/home/s3400220/swarmfire/vids",
             # Start with pure exploration weights — curriculum callback takes over
-            phase_weights={"exploration": 3.0, "fire_discovery": 0.0,
-                           "fire_tracking": 0.0, "risk": 0.0},
+            phase_weights={"exploration": 5.0, "fire_discovery": 9.8,
+                           "fire_tracking": 6.0, "risk": 5.0},
         )
         return TimeLimit(env, max_episode_steps=ITER_LIMIT)
     return _init
@@ -273,8 +595,38 @@ def make_env(rank, is_eval=False):
 # ─────────────────────────────────────────────
 
 if __name__ == "__main__":
+
+    parser = argparse.ArgumentParser(
+        prog='rl_train.py',
+        description='Trains the DRL model and saves/loads from checkpoint',
+        epilog=''
+    )
+
+    parser.add_argument('-c', '--checkpoint')
+    parser.add_argument('-r', '--render-mode')
+    parser.add_argument('-s', '--sample-interval')
+
+
+    args = parser.parse_args()
+
+    reset_timesteps = True
+    f_checkpoint = None
+    f_vecnormalize = None
+    is_ckpt_load = False
+    if args.checkpoint is not None:
+        print(f"Using checkpoint {args.checkpoint}")
+        f_checkpoint = f"firescout_{args.checkpoint}_steps.zip"
+        f_vecnormalize = f"firescout_vecnormalize_{args.checkpoint}_steps.pkl"
+        reset_timesteps = False
+        is_ckpt_load = True
+
+    
+
+
     torch.set_num_threads(2)
     torch.set_num_interop_threads(2)
+
+    wandb.init(project="thesis-drl")
 
     # Training env
     train_env = DummyVecEnv([make_env(0)])
@@ -300,34 +652,52 @@ if __name__ == "__main__":
     else:
         raise ValueError(f"Unknown curriculum: {CURRICULUM}")
 
-    # Model
 
-    model = RecurrentPPO(
-        "MultiInputLstmPolicy",
-        train_env,
-        policy_kwargs=dict(
-            features_extractor_class=CnnModel.PlainCNNExtractor,
-            features_extractor_kwargs=dict(features_dim=256),
-            lstm_hidden_size=256,
-            n_lstm_layers=1,
-            shared_lstm=False,        # separate LSTM for actor and critic
-            enable_critic_lstm=True,
-            normalize_images=False,
-        ),
-        verbose=1,
-        learning_rate=3e-4,
-        n_steps=512,              # steps per env per rollout
-        batch_size=256,
-        n_epochs=10,
-        gamma=0.99,
-        gae_lambda=0.95,
-        ent_coef=0.05,
-        max_grad_norm=0.5,
-    )
+
+    # Model
+    if is_ckpt_load:
+        train_env = VecNormalize.load(f_vecnormalize, train_env)
+        train_env.training = True       # re-enable stat updates for continued training
+        train_env.norm_reward = True    # make sure this matches your original training config
+        print(f"[MAIN] : Loading checkpoint file {f_checkpoint}")
+        model = RecurrentPPO.load(f_checkpoint, env=train_env)
+    else:
+        temporal_xformer_policy_kwargs = dict(
+            features_extractor_class=TemporalTransformerModel.TemporalTransformerExtractor,
+            features_extractor_kwargs=dict(
+                features_dim=256,
+                n_heads=4,
+                n_layers=3,
+                memory_len=8,   # how many past frames to attend over
+            ),
+        )
+        
+        model = RecurrentPPO(
+            "MultiInputLstmPolicy",
+            train_env,
+            policy_kwargs=dict(
+                features_extractor_class=CnnModel.PlainCNNExtractor,
+                features_extractor_kwargs=dict(features_dim=256),
+                lstm_hidden_size=512,
+                n_lstm_layers=4,
+                shared_lstm=False,        # separate LSTM for actor and critic
+                enable_critic_lstm=True,
+                normalize_images=False,
+            ),
+            verbose=1,
+            learning_rate=3e-4,
+            n_steps=512,              # steps per env per rollout
+            batch_size=256,
+            n_epochs=10,
+            gamma=0.99,
+            gae_lambda=0.95,
+            ent_coef=0.05,
+            max_grad_norm=0.5,
+        )
 
     callbacks = [
         TrainingMonitorCallback(verbose=1),
-        curriculum_cb,
+        # curriculum_cb,
         CheckpointCallback(
             save_freq=50_000,
             save_path="./checkpoints/",
@@ -336,12 +706,13 @@ if __name__ == "__main__":
         ),
         EvalCallback(
             eval_env,
-            best_model_save_path="./best_model/",
+            best_model_save_path="./best_model/",                                                                       
             log_path="./logs/",
             eval_freq=50_000,
             n_eval_episodes=5,
             deterministic=True,
         ),
+        WandbLoggingCallback()
     ]
 
     model.learn(

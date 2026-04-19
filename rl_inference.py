@@ -2,6 +2,7 @@ from envs.MultiAgentEnv import MultiAgentEnv
 
 from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
+from sb3_contrib import RecurrentPPO
 
 env = DummyVecEnv(
     [
@@ -15,12 +16,14 @@ env = DummyVecEnv(
             seed=27,
             is_vid_out=True,
             vid_id="no_swarming_global_reward",
-            vid_base_path="/home/gjs/software/thesis/swarmfire/vids/"
+            vid_base_path="/home/gjs/software/thesis/swarmfire/vids/",
+            phase_weights={"exploration": 2.0, "fire_discovery": 3.8,
+                           "fire_tracking": 2.0, "risk": 2.0}
         )
     ]
 )
-env = VecNormalize(env, norm_obs=False, norm_reward=True, clip_reward=10.0)
-model = PPO.load("./single_agent.zip", env=env)
+env = VecNormalize.load("checkpoints/firescout_vecnormalize_400000_steps.pkl", env)
+model = RecurrentPPO.load("checkpoints/firescout_400000_steps.zip", env=env)
 
 
 
