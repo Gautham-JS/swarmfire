@@ -57,8 +57,8 @@ class SingleAgentEnv(gym.Env):
 
         self._episode_count = 0
 
-        self._recency_decay = 0.995   # per-step decay factor; tune this
-        self._recency_visit_bump = 0.02  # value stamped on visit
+        self._recency_decay = 0.9995   # per-step decay factor; tune this
+        self._recency_visit_bump = 0.04  # value stamped on visit
 
         # reward fn weights
         self.set_reward_weights(phase_weights)
@@ -66,8 +66,8 @@ class SingleAgentEnv(gym.Env):
 
         self.vp_size = 128
         self.step_size = 1
-        self.map_update_interval = 500
-        self.stepped_map_update = True
+        self.map_update_interval = 50
+        self.stepped_map_update = False
         self.reduction_factor = 2
 
         self.actions_per_agent = 2
@@ -163,9 +163,10 @@ class SingleAgentEnv(gym.Env):
         if not self.fixed_seed and self.seed is not None and self._episode_count > 10:
             if ( (self._episode_count - 1) % self.map_update_interval == 0):
                 self.seed+=1
-                self.map_update_interval = self.map_update_interval // 2
-                if self.map_update_interval < 1:
-                    self.map_update_interval = 1
+                if self.stepped_map_update:
+                    self.map_update_interval = self.map_update_interval // 2
+                    if self.map_update_interval < 1:
+                        self.map_update_interval = 1
             
         self.map = self.world_gen.create_map(0.001, 0.003, seed=self.seed)
 

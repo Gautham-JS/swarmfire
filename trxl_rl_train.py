@@ -357,9 +357,9 @@ def make_env_fn(cfg: Config, rank: int):
             vid_id          = f"firescout_env{rank}",
             vid_base_path   = "/home/s3400220/swarmfire/vids_parallel/",
             phase_weights   = {
-                "exploration":    5.0,
+                "exploration":    3.0,
                 "fire_discovery": 9.8,
-                "fire_tracking":  6.0,
+                "fire_tracking":  0.5,
                 "risk":           5.0,
             },
             device=torch.device("cuda:1")

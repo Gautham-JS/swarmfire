@@ -1,5 +1,7 @@
 import torch
 import torch.nn as nn
+from torch.nn.utils import spectral_norm
+
 import numpy as np
 import gymnasium as gym
 from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
@@ -15,11 +17,12 @@ class TrXLBlock(nn.Module):
             dropout=dropout,
             batch_first=True,
         )
-        self.ff = nn.Sequential(
-            nn.Linear(d_model, d_ff), nn.ReLU(),
-            nn.Linear(d_ff, d_model),
-        )
+        # Spectral norm on FF layers — constrains weight growth
+        self.ff1  = spectral_norm(nn.Linear(d_model, d_ff))
+        self.ff2  = spectral_norm(nn.Linear(d_ff, d_model))
+        self.act  = nn.ReLU()
         self.drop = nn.Dropout(dropout)
+    
     def _check(self, tensor, name):
         if torch.isnan(tensor).any():
             raise RuntimeError(f"NaN detected in TrXLBlock at: {name}")
@@ -27,20 +30,20 @@ class TrXLBlock(nn.Module):
             raise RuntimeError(f"Inf detected in TrXLBlock at: {name}")
 
     def forward(self, x, memory=None):
-        # x:      (B, 1, D)  — current token
-        # memory: (B, M, D)  — cached past hidden states, detached; or None
-        x_norm = self.norm1(x)
-
+        x_norm      = self.norm1(x)
         self._check(x_norm, "X norm1 output")
-
-        kv = torch.cat([memory, x_norm], dim=1) if memory is not None else x_norm
+        kv          = torch.cat([memory, x_norm], dim=1) if memory is not None else x_norm
 
         attn_out, _ = self.attn(query=x_norm, key=kv, value=kv)
+        attn_out    = torch.clamp(attn_out, -10.0, 10.0)
         self._check(attn_out, "Attention output")
-        x = x + self.drop(attn_out)
-        self._check(x, "X first dropout layer")
-        x = x + self.drop(self.ff(self.norm2(x)))
-        self._check(x, "X second dropout layer")
+        x           = x + self.drop(attn_out)
+
+        ff_out      = self.ff2(self.act(self.ff1(self.norm2(x))))
+        self._check(x, "X first FF layer")
+        ff_out      = torch.clamp(ff_out, -10.0, 10.0)
+        x           = x + self.drop(ff_out)
+        self._check(x, "X dropout layer")
         return x
 
 
