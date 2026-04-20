@@ -1,9 +1,126 @@
 
 
-
+import numpy as np
 import torch
 import torch.nn as nn
 from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
+
+
+from collections import deque
+
+
+
+
+class TransformerExtractor(BaseFeaturesExtractor):
+    def __init__(self, observation_space, features_dim=256, seq_len=16):
+        super().__init__(observation_space, features_dim)
+
+        self.seq_len = seq_len
+        self.d_model = 256
+
+        # CNN for viewport
+        self.cnn = nn.Sequential(
+            nn.Conv2d(3, 32, 8, stride=4),
+            nn.ReLU(),
+            nn.Conv2d(32, 64, 4, stride=2),
+            nn.ReLU(),
+            nn.Conv2d(64, 64, 3, stride=1),
+            nn.ReLU(),
+            nn.Flatten(),
+        )
+        self.cnn_fc = nn.Linear(3136, 256)
+
+        # positions encoder
+        self.pos_mlp = nn.Sequential(
+            nn.Linear(observation_space["positions"].shape[0], 64),
+            nn.ReLU(),
+            nn.Linear(64, 128)
+        )
+
+        # projection
+        self.input_proj = nn.Linear(256 + 128, self.d_model)
+
+        # positional encoding
+        self.pos_embedding = nn.Parameter(torch.zeros(1, seq_len, self.d_model))
+
+        # transformer
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=self.d_model,
+            nhead=4,
+            batch_first=True,
+            norm_first=True
+        )
+
+        self.transformer = nn.TransformerEncoder(
+            encoder_layer,
+            num_layers=2
+        )
+
+        # gating (stability)
+        self.gate = nn.Parameter(torch.tensor(0.5))
+
+        # runtime buffer (NOT part of model params)
+        self._buffers = None
+
+    def reset_buffer(self, n_envs):
+        self._buffers = [
+            deque(maxlen=self.seq_len) for _ in range(n_envs)
+        ]
+
+    def _encode_single(self, obs):
+        vp = obs["viewport"]
+        pos = obs["positions"]
+
+        vp_emb = self.cnn_fc(self.cnn(vp))
+        pos_emb = self.pos_mlp(pos)
+
+        return torch.cat([vp_emb, pos_emb], dim=-1)
+
+    def forward(self, observations):
+        """
+        observations:
+            dict of tensors (B, ...)
+        """
+
+        B = observations["viewport"].shape[0]
+
+        if self._buffers is None:
+            self.reset_buffer(B)
+
+        tokens = []
+
+        for i in range(B):
+            obs_i = {
+                "viewport": observations["viewport"][i].unsqueeze(0),
+                "positions": observations["positions"][i].unsqueeze(0)
+            }
+
+            token = self._encode_single(obs_i).squeeze(0)
+
+            self._buffers[i].append(token.detach())  # store without grad
+
+            seq = list(self._buffers[i])
+
+            # pad sequence
+            while len(seq) < self.seq_len:
+                seq.insert(0, seq[0])
+
+            seq = torch.stack(seq, dim=0)  # (T, D)
+            tokens.append(seq)
+
+        x = torch.stack(tokens, dim=0)  # (B, T, D)
+
+        x = self.input_proj(x)
+        x = x + self.pos_embedding[:, :x.size(1)]
+
+        T = x.size(1)
+        mask = torch.triu(torch.ones(T, T, device=x.device), diagonal=1).bool()
+
+        x_trans = self.transformer(x, mask=mask)
+
+        x = self.gate * x_trans + (1 - self.gate) * x
+
+        return x[:, -1]  # last token
 
 
 

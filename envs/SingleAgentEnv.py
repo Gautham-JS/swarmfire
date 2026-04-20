@@ -33,7 +33,8 @@ class SingleAgentEnv(gym.Env):
             is_vid_out=False, 
             vid_base_path = "./vids/", 
             vid_id="test_",
-            phase_weights:dict = None
+            phase_weights:dict = None,
+            device=None
         ):
         super().__init__()
 
@@ -48,7 +49,10 @@ class SingleAgentEnv(gym.Env):
         self.save_int = save_interval
         self.fixed_seed = fixed_seed
 
-        self.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+        if device is not None:
+            self.device=device
+        else:
+            self.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
         #self.device = torch.device("cpu")
 
         self._episode_count = 0
@@ -62,6 +66,9 @@ class SingleAgentEnv(gym.Env):
 
         self.vp_size = 128
         self.step_size = 1
+        self.map_update_interval = 500
+        self.stepped_map_update = True
+        self.reduction_factor = 2
 
         self.actions_per_agent = 2
         self.n_actions = self.n_agents * self.actions_per_agent
@@ -71,7 +78,7 @@ class SingleAgentEnv(gym.Env):
         # n_agents * (x, y, vx, vy, fire_dx, fire_dy, fire_dist) = n_agents * 7
         self.observation_space = gym.spaces.Dict({
             "viewport": gym.spaces.Box(low=0.0, high=1.0, shape=(3, 84, 84), dtype=np.float32),
-            "positions": gym.spaces.Box(low=-1.0, high=1.0, shape=(self.n_agents * 7,), dtype=np.float32)
+            "positions": gym.spaces.Box(low=-1.0, high=1.0, shape=(self.n_agents * 4,), dtype=np.float32)
         })
 
         self.world_gen = Generators.FuelMapGenerator(self.world_size)
@@ -113,11 +120,6 @@ class SingleAgentEnv(gym.Env):
 
         print(f"[REWARD_WEIGHTS_UPDATE] -> exploration : {self._w_exploration} | fire discovery : {self._w_fire_discovery} | fire tracking : {self._w_fire_tracking} | risk : {self._w_risk}")
 
-    def create_model_descriptor_dict(self):
-        d = {}
-        d["n_agents"] = self.n_agents
-        d["observation_space"] = "gym.spaces.Dict\{'viewport': gym.spaces.Box(low=0.0, high=1.0, shape=(3, 84, 84), dtype=np.float32), \}"
-
     def get_position_delta_from_action(self, action):
         if action == 0:
             return -1 * self.step_size
@@ -139,7 +141,7 @@ class SingleAgentEnv(gym.Env):
 
         if self._episode_count!=0 and self._episode_count % self.sample_int == 0:
             print(f"[RESET] Episode {self._episode_count} ends: ")
-            print(f"[RESET] Reward history - MAX : {np.max(self._reward_history)} | MEAN : {np.mean(self._reward_history)} | MIN : {np.min(self._reward_history)}")
+            print(f"[RESET] Reward history - MAX : {np.max(self._reward_history[10:])} | MEAN : {np.mean(self._reward_history[10:])} | MIN : {np.min(self._reward_history[10:])}")
 
         # Clear episode state without destroying the video writer or figure
         self._obs_hsitory    = []
@@ -158,22 +160,13 @@ class SingleAgentEnv(gym.Env):
         self.fire_disc_map = np.full(self.world_size, -1, dtype=np.int32)
         self.view_acc.reset()
 
-        # Generate map
-        # if not self.fixed_seed and self.seed is not None and self._episode_count > 10:
-        #     if (self._episode_count - 1) <= 200:
-        #         self.map = self.world_gen.create_map(0.001, 0.003, seed=self.seed)
-        #     elif self._episode_count - 1 <= 300:
-        #         if (self._episode_count - 1) % 10 == 0:
-        #             self.seed += 1
-        #         self.map = self.world_gen.create_map(0.001, 0.003, seed=self.seed)
-        #     else:
-        #         self.map = self.world_gen.create_map(0.001, 0.003, seed=None)
-        # else:
-        #     self.map = self.world_gen.create_map(0.001, 0.003, seed=self.seed)
-
         if not self.fixed_seed and self.seed is not None and self._episode_count > 10:
-            if ( (self._episode_count - 1) % 500 == 0):
+            if ( (self._episode_count - 1) % self.map_update_interval == 0):
                 self.seed+=1
+                self.map_update_interval = self.map_update_interval // 2
+                if self.map_update_interval < 1:
+                    self.map_update_interval = 1
+            
         self.map = self.world_gen.create_map(0.001, 0.003, seed=self.seed)
 
         # Spawn agents
@@ -269,7 +262,7 @@ class SingleAgentEnv(gym.Env):
         return self.recency_map[x0:x1, y0:y1]
 
 
-    def calculate_reward(self, delta_views, recency_map):
+    def calculate_reward_shelved(self, delta_views, recency_map):
 
         step_advantage = 1.4 * (1 + (
             1 - GenericUtils.normalize_data(self._step_count, 0, self.iter_limit)
@@ -296,9 +289,55 @@ class SingleAgentEnv(gym.Env):
 
             reward -= nb_penality
             reward -= self.recency_penality(px, py, c_rp=2)
-        
-            # if self._episode_count !=0 and (self._episode_count % self.sample_int == 0):
-            #     print(f"[CALC REWARD] : Recency penality : {self.recency_penality(px, py, c_rp=10)}")
+
+        return reward
+    
+    def calculate_reward(self, delta_views, recency_map):
+        reward = 0.0
+
+        for i, (delta, pos) in enumerate(zip(delta_views, self._agent_positions)):
+            px, py = pos
+            half = self.vp_size // 2
+            x0 = np.clip(px - half, 0, self.world_size[0])
+            x1 = np.clip(px + half, 0, self.world_size[0])
+            y0 = np.clip(py - half, 0, self.world_size[1])
+            y1 = np.clip(py + half, 0, self.world_size[1])
+
+            local_view = self.view_acc.get_scene()[x0:x1, y0:y1, :]
+
+            # Raw pixel counts — avoid dividing by vp_size**2 which squashes signal
+            new_fuel_pixels  = float(np.sum(delta[:, :, 0] > 0))
+            new_fire_pixels  = float(np.sum(delta[:, :, 1] > 0))
+            seen_fuel_pixels = float(np.sum(local_view[:, :, 0] > 0))
+            seen_fire_pixels = float(np.sum(local_view[:, :, 1] > 0))
+
+            # Scale to produce rewards in [0, 10] range per step
+            exploration = 0.03 * new_fuel_pixels          # 200 new pixels → 8.0
+            fire_disc   = 0.09 * new_fire_pixels          # 100 new fire pixels → 8.0
+            fire_track  = 0.01 * seen_fire_pixels         # 500 seen fire → 5.0
+            fuel_track = 0.005 * seen_fuel_pixels
+
+            # Dense movement bonus — prevents zero-gradient steps
+            if len(self._pos_history) >= 2:
+                prev = self._pos_history[-2][i]
+                moved = abs(px - prev[0]) + abs(py - prev[1]) > 0.2
+                movement = 0.3 if moved else -0.5
+            else:
+                movement = 0.0
+
+            # Penalties
+            boundary = self.calculate_near_boundary_penalty(px, py)
+            recency  = float(np.mean(self.extract_recency_map(px, py))) * 35.0
+
+            reward += (
+                self._w_exploration    * exploration
+            + self._w_exploration    * fuel_track
+            + self._w_fire_discovery * fire_disc
+            + self._w_fire_tracking  * fire_track
+            + movement
+            - boundary
+            - recency
+            )
 
         return reward
     
@@ -355,7 +394,7 @@ class SingleAgentEnv(gym.Env):
         return total
     
     def calculate_near_boundary_penalty(self, x, y):
-        margin = self.vp_size  # start penalising one viewport-width from the edge
+        margin = self.vp_size // 2  # start penalising half viewport-width from the edge ir when view hits edge
         penalty = 0.0
         for coord, limit in [(x, self.world_size[0]), (y, self.world_size[1])]:
             # distance from each of the two walls for this axis
@@ -365,7 +404,7 @@ class SingleAgentEnv(gym.Env):
                 penalty += np.exp((margin - dist_low) / (margin / 3)) - 1
             if dist_high < margin:
                 penalty += np.exp((margin - dist_high) / (margin / 3)) - 1
-        return 0.01 * penalty
+        return 0.5 * penalty
 
     def mark_recency_map(self, px, py):
         half = self.vp_size // 2
@@ -434,17 +473,17 @@ class SingleAgentEnv(gym.Env):
             obs.append(np.clip(vy, -1, 1))
 
             # Direction to nearest known fire (or zeros if none)
-            if len(fire_coords) > 0:
-                diffs = fire_coords - np.array([px, py])
-                dists = np.linalg.norm(diffs, axis=1)
-                nearest = diffs[np.argmin(dists)]
-                dist = dists.min()
-                fire_dir = nearest / (dist + 1e-8)
-                obs.append(float(np.clip(fire_dir[0], -1, 1)))
-                obs.append(float(np.clip(fire_dir[1], -1, 1)))
-                obs.append(float(np.clip(dist / max(self.world_size), 0, 1)))
-            else:
-                obs.extend([0.0, 0.0, 1.0])  # no fire known, max distance
+            # if len(fire_coords) > 0:
+            #     diffs = fire_coords - np.array([px, py])
+            #     dists = np.linalg.norm(diffs, axis=1)
+            #     nearest = diffs[np.argmin(dists)]
+            #     dist = dists.min()
+            #     fire_dir = nearest / (dist + 1e-8)
+            #     obs.append(float(np.clip(fire_dir[0], -1, 1)))
+            #     obs.append(float(np.clip(fire_dir[1], -1, 1)))
+            #     obs.append(float(np.clip(dist / max(self.world_size), 0, 1)))
+            # else:
+            #     obs.extend([0.0, 0.0, 1.0])  # no fire known, max distance
 
         return np.asarray(obs, dtype=np.float32)
 
@@ -480,7 +519,7 @@ class SingleAgentEnv(gym.Env):
                 py = np.clip(py, 0, self.world_size[1] - 1)
                 self._agent_positions[i] = (px, py)
                 agent.set_position({'x': px, 'y': py, 'z': 0})  # zero out accumulated velocity
-                penality += 0.7 
+                penality += 55 
                 is_oob = True
             
 
@@ -538,6 +577,9 @@ class SingleAgentEnv(gym.Env):
 
 
         total_reward -= penality_scale * penality
+
+        if self._episode_count !=0 and (self._episode_count % self.sample_int == 0) and (self._step_count % 50 == 0):
+            print(f"[CALC REWARD] : total reward value = {total_reward} | penality scale : {penality}")
 
         self._reward_history.append(total_reward)
         self._obs_hsitory.append(scene_obs)
