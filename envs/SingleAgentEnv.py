@@ -24,6 +24,7 @@ class SingleAgentEnv(gym.Env):
             world_size, 
             start_positions:list=None, 
             iter_limit=4500, 
+            vp_size=64,
             seed = None, 
             fixed_seed=False,
             env_id="MultiAgentEnv", 
@@ -64,9 +65,9 @@ class SingleAgentEnv(gym.Env):
         self.set_reward_weights(phase_weights)
 
 
-        self.vp_size = 128
+        self.vp_size = vp_size
         self.step_size = 1
-        self.map_update_interval = 50
+        self.map_update_interval = 20
         self.stepped_map_update = False
         self.reduction_factor = 2
 
@@ -114,6 +115,7 @@ class SingleAgentEnv(gym.Env):
         if weights is None:
             weights = {}
         self._w_exploration    = weights.get("exploration",    1.0)
+        self._w_exploration_track    = weights.get("exploration_tracking",    1.0)
         self._w_fire_discovery = weights.get("fire_discovery", 1.0)
         self._w_fire_tracking  = weights.get("fire_tracking",  1.0)
         self._w_risk           = weights.get("risk",           1.0)
@@ -293,8 +295,136 @@ class SingleAgentEnv(gym.Env):
 
         return reward
     
+    def calculate_fire_crossing_penalty(self, px, py) -> float:
+        """
+        Hard penalty when the agent's current position is inside a fire cell.
+        Uses the ground-truth map (not the accumulated view) so it fires
+        the instant the drone crosses into burning terrain.
+
+        Returns a positive scalar to be SUBTRACTED from the reward.
+        """
+        cx = int(np.clip(px, 0, self.world_size[0] - 1))
+        cy = int(np.clip(py, 0, self.world_size[1] - 1))
+
+        fire_value = float(self.map[cx, cy, 1])
+
+        if fire_value <= 0.0:
+            return 0.0
+
+        # Scale penalty with fire intensity so the agent learns to avoid
+        # even low-intensity fire cells, not just peak-intensity ones.
+        base_penalty = 80.0
+        return base_penalty * (0.5 + 0.5 * fire_value)
+
+    def fire_perimeter_alignment_reward(self, delta_views) -> float:
+        """
+        Rewards the agent for moving *along* the fire boundary (tangentially)
+        rather than through it.  Uses a Sobel gradient on the local fire patch
+        to estimate the boundary normal; the tangent is perpendicular to that.
+
+        Positive reward  → agent is tracing the fire edge.
+        Zero reward      → agent is stationary or moving away from the boundary.
+        No negative term → handled separately by fire_crossing_penalty.
+        """
+        from scipy.ndimage import sobel
+
+        total = 0.0
+        for i, (delta, pos) in enumerate(zip(delta_views, self._agent_positions)):
+            px, py = pos
+            half = self.vp_size // 2
+            x0 = int(np.clip(px - half, 0, self.world_size[0]))
+            x1 = int(np.clip(px + half, 0, self.world_size[0]))
+            y0 = int(np.clip(py - half, 0, self.world_size[1]))
+            y1 = int(np.clip(py + half, 0, self.world_size[1]))
+
+            fire_patch = self.map[x0:x1, y0:y1, 1]
+            if not np.any(fire_patch > 0):
+                continue
+
+            # ── Estimate boundary normal via Sobel gradient ───────────────────
+            gx  = sobel(fire_patch.astype(np.float32), axis=1)
+            gy  = sobel(fire_patch.astype(np.float32), axis=0)
+            mag = np.sqrt(gx ** 2 + gy ** 2)
+
+            total_mag = mag.sum()
+            if total_mag < 1e-6:
+                continue
+
+            # Weighted mean gradient direction at boundary pixels
+            boundary_normal = np.array([
+                np.sum(gy * mag) / total_mag,
+                np.sum(gx * mag) / total_mag,
+            ], dtype=np.float64)
+            bn_norm = np.linalg.norm(boundary_normal)
+            if bn_norm < 1e-8:
+                continue
+            boundary_normal /= bn_norm
+
+            # Tangent = 90° rotation of the normal
+            boundary_tangent = np.array([-boundary_normal[1], boundary_normal[0]])
+
+            # ── Agent velocity direction ───────────────────────────────────────
+            if len(self._pos_history) < 2:
+                continue
+            prev = self._pos_history[-2][i]
+            curr = self._pos_history[-1][i]
+            vel  = np.array([curr[0] - prev[0], curr[1] - prev[1]], dtype=np.float64)
+            vel_norm = np.linalg.norm(vel)
+            if vel_norm < 1e-6:
+                continue
+            vel_dir = vel / vel_norm
+
+            # ── Alignment score ───────────────────────────────────────────────
+            alignment = float(np.dot(vel_dir, boundary_tangent))
+            # reward positive alignment (following the edge); ignore moving away
+            total += max(0.0, alignment) * 6.0
+        return total
+    
+    def fire_proximity_bonus(self, px, py, ideal_dist_cells: float = 3.0) -> float:
+        """
+        Small dense reward for being *near* but not *inside* fire.
+        Peaks at `ideal_dist_cells` away from the nearest fire pixel and
+        falls off as a Gaussian on either side, so the agent is pulled
+        toward the perimeter without being rewarded for entering fire.
+
+        Returns a positive scalar to be ADDED to the reward.
+        """
+        cx = int(np.clip(px, 0, self.world_size[0] - 1))
+        cy = int(np.clip(py, 0, self.world_size[1] - 1))
+
+        # Standing inside fire → no proximity bonus (crossing penalty handles it)
+        if self.map[cx, cy, 1] > 0:
+            return 0.0
+
+        half = self.vp_size // 2
+        x0 = int(np.clip(px - half, 0, self.world_size[0]))
+        x1 = int(np.clip(px + half, 0, self.world_size[0]))
+        y0 = int(np.clip(py - half, 0, self.world_size[1]))
+        y1 = int(np.clip(py + half, 0, self.world_size[1]))
+
+        fire_patch = self.map[x0:x1, y0:y1, 1]
+        fire_coords = np.argwhere(fire_patch > 0)
+        if len(fire_coords) == 0:
+            return 0.0
+
+        # Distance from patch-local agent centre to nearest fire pixel
+        local_cx = cx - x0
+        local_cy = cy - y0
+        diffs = fire_coords - np.array([local_cx, local_cy])
+        dist  = float(np.min(np.linalg.norm(diffs, axis=1)))
+
+        # Gaussian centred on `ideal_dist_cells`
+        sigma  = ideal_dist_cells * 0.8
+        bonus  = 3.0 * np.exp(-0.5 * ((dist - ideal_dist_cells) / sigma) ** 2)
+        return float(bonus)
+
+
     def calculate_reward(self, delta_views, recency_map):
         reward = 0.0
+
+        step_advantage = 1.5 * (1 + (
+            1 - GenericUtils.normalize_data(self._step_count, 0, self.iter_limit)
+        ))
 
         for i, (delta, pos) in enumerate(zip(delta_views, self._agent_positions)):
             px, py = pos
@@ -328,12 +458,12 @@ class SingleAgentEnv(gym.Env):
 
             # Penalties
             boundary = self.calculate_near_boundary_penalty(px, py)
-            recency  = float(np.mean(self.extract_recency_map(px, py))) * 35.0
+            recency  = float(np.mean(self.extract_recency_map(px, py))) * 75.0
 
             reward += (
                 self._w_exploration    * exploration
-            + self._w_exploration    * fuel_track
-            + self._w_fire_discovery * fire_disc
+            + self._w_exploration_track    * fuel_track
+            + self._w_fire_discovery * fire_disc * step_advantage
             + self._w_fire_tracking  * fire_track
             + movement
             - boundary
@@ -341,7 +471,6 @@ class SingleAgentEnv(gym.Env):
             )
 
         return reward
-    
 
     def _fire_boundary_tracking_reward(self, delta_views) -> float:
         """
