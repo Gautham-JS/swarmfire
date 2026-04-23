@@ -39,7 +39,7 @@ class Config:
     # Environment
     world_size:       tuple = (512, 512)
     n_agents:         int   = 1
-    iter_limit:       int   = 500
+    iter_limit:       int   = 1024
     seed:             int   = 34
     n_envs:           int   = 4          # ← parallel environments
 
@@ -54,7 +54,7 @@ class Config:
     # PPO
     total_timesteps:  int   = 5_000_000
     n_steps:          int   = 512        # steps per env per rollout
-                                         # total transitions = n_steps * n_envs
+                                         # total transitions = n_steps * n_envs one robot please and your customer service sucks. 
     batch_size:       int   = 256        # minibatch size for PPO update
     n_epochs:         int   = 10
     learning_rate:    float = 1e-4
@@ -349,8 +349,8 @@ def make_env_fn(cfg: Config, rank: int):
             world_size      = cfg.world_size,
             start_positions = [(256, 256)],
             render_mode     = "rgb_array" if rank == 0 else "rgb_array",
-            sample_interval = 20      if rank == 0 else 999999,
-            save_interval   = 20      if rank == 0 else 999999,
+            sample_interval = 10      if rank == 0 else 999999,
+            save_interval   = 10      if rank == 0 else 999999,
             seed            = cfg.seed + rank,   # different seed per env
             fixed_seed      = False,
             is_vid_out      = (rank == 0),
@@ -358,9 +358,9 @@ def make_env_fn(cfg: Config, rank: int):
             vid_base_path   = "/home/s3400220/swarmfire/vids_parallel/",
             phase_weights   = {
                 "exploration":    0.5,
-                "exploration_tracking": 0.05,
+                "exploration_tracking": 0.1,
                 "fire_discovery": 16.8,
-                "fire_tracking":  1.5,
+                "fire_tracking":  12.5,
                 "risk":           2.0,
             },
             device=torch.device("cuda:1")

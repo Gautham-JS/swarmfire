@@ -419,55 +419,125 @@ class SingleAgentEnv(gym.Env):
         return float(bonus)
 
 
+    def calculate_near_boundary_penalty(self, x, y):
+        """
+        Exponential penalty that grows sharply as agent approaches the wall.
+        Increased scale so it decisively dominates any wall-camping reward.
+        """
+        margin = self.vp_size // 2
+        penalty = 0.0
+        for coord, limit in [(x, self.world_size[0]), (y, self.world_size[1])]:
+            dist_low  = coord
+            dist_high = limit - coord
+            if dist_low < margin:
+                penalty += np.exp((margin - dist_low) / (margin / 4)) - 1
+            if dist_high < margin:
+                penalty += np.exp((margin - dist_high) / (margin / 4)) - 1
+        # Removed the 0.5 discount — boundary must hurt more than staying pays
+        return penalty
+
+
+    def _viewport_coverage_fraction(self, px, py) -> float:
+        """
+        Returns the fraction of the viewport that lies within world bounds [0, 1].
+        Used to scale down rewards when the agent is near a wall and half its
+        viewport is zero-padded — prevents the agent from getting free reward
+        for looking at nothing.
+        """
+        half = self.vp_size // 2
+        x0 = max(px - half, 0);  x1 = min(px + half, self.world_size[0])
+        y0 = max(py - half, 0);  y1 = min(py + half, self.world_size[1])
+        valid_pixels = (x1 - x0) * (y1 - y0)
+        total_pixels = self.vp_size * self.vp_size
+        return valid_pixels / total_pixels
+
+
     def calculate_reward(self, delta_views, recency_map):
         reward = 0.0
 
-        step_advantage = 1.5 * (1 + (
-            1 - GenericUtils.normalize_data(self._step_count, 0, self.iter_limit)
+        step_advantage = 2.0 * (1.0 + (
+            1.0 - GenericUtils.normalize_data(self._step_count, 0, self.iter_limit)
         ))
 
         for i, (delta, pos) in enumerate(zip(delta_views, self._agent_positions)):
             px, py = pos
             half = self.vp_size // 2
-            x0 = np.clip(px - half, 0, self.world_size[0])
-            x1 = np.clip(px + half, 0, self.world_size[0])
-            y0 = np.clip(py - half, 0, self.world_size[1])
-            y1 = np.clip(py + half, 0, self.world_size[1])
+            x0 = int(np.clip(px - half, 0, self.world_size[0]))
+            x1 = int(np.clip(px + half, 0, self.world_size[0]))
+            y0 = int(np.clip(py - half, 0, self.world_size[1]))
+            y1 = int(np.clip(py + half, 0, self.world_size[1]))
 
             local_view = self.view_acc.get_scene()[x0:x1, y0:y1, :]
 
-            # Raw pixel counts — avoid dividing by vp_size**2 which squashes signal
+            # ── Viewport validity scale — kills reward when viewport is clipped ──
+            vp_scale = self._viewport_coverage_fraction(px, py)
+            # Sharpen it: if only 60% of viewport is valid, reward is 0.6^2 = 0.36
+            # This creates a much steeper disincentive for wall-proximity than
+            # a linear scale would provide
+            vp_scale = vp_scale ** 2
+
+            # ── Raw pixel counts ──────────────────────────────────────────────────
             new_fuel_pixels  = float(np.sum(delta[:, :, 0] > 0))
             new_fire_pixels  = float(np.sum(delta[:, :, 1] > 0))
             seen_fuel_pixels = float(np.sum(local_view[:, :, 0] > 0))
-            seen_fire_pixels = float(np.sum(local_view[:, :, 1] > 0))
 
-            # Scale to produce rewards in [0, 10] range per step
-            exploration = 0.03 * new_fuel_pixels          # 200 new pixels → 8.0
-            fire_disc   = 0.09 * new_fire_pixels          # 100 new fire pixels → 8.0
-            fire_track  = 0.01 * seen_fire_pixels         # 500 seen fire → 5.0
-            fuel_track = 0.005 * seen_fuel_pixels
+            # ── Core rewards — all scaled by viewport validity ────────────────────
+            exploration = self._w_exploration * 0.03 * new_fuel_pixels * vp_scale
+            fire_disc   = self._w_fire_discovery * 0.09 * new_fire_pixels * step_advantage * vp_scale
+            fuel_track  = self._w_exploration_track * 0.001 * seen_fuel_pixels * vp_scale
 
-            # Dense movement bonus — prevents zero-gradient steps
+            # ── Fire perimeter following ──────────────────────────────────────────
+            perimeter_reward = self._w_fire_tracking * self.fire_perimeter_alignment_reward([delta]) * vp_scale
+            proximity        = self.fire_proximity_bonus(px, py) * vp_scale
+
+            # ── Movement: stronger signal, velocity-aware ─────────────────────────
             if len(self._pos_history) >= 2:
-                prev = self._pos_history[-2][i]
-                moved = abs(px - prev[0]) + abs(py - prev[1]) > 0.2
-                movement = 0.3 if moved else -0.5
+                prev  = self._pos_history[-2][i]
+                curr  = self._pos_history[-1][i]
+                dx    = curr[0] - prev[0]
+                dy    = curr[1] - prev[1]
+                moved = abs(dx) + abs(dy) > 0.2
+
+                # Extra bonus for moving AWAY from the nearest wall
+                dist_to_nearest_wall = min(px, self.world_size[0] - px,
+                                        py, self.world_size[1] - py)
+                in_margin = dist_to_nearest_wall < self.vp_size // 2
+
+                if moved:
+                    # Reward moving away from wall when in margin zone
+                    if in_margin:
+                        # Check if the move increased distance to nearest wall
+                        prev_dist = min(prev[0], self.world_size[0] - prev[0],
+                                        prev[1], self.world_size[1] - prev[1])
+                        curr_dist = min(curr[0], self.world_size[0] - curr[0],
+                                        curr[1], self.world_size[1] - curr[1])
+                        moving_away = curr_dist > prev_dist
+                        movement = 2.0 if moving_away else -0.3
+                    else:
+                        movement = 0.5
+                else:
+                    movement = -1.5   # stronger penalty for staying still
             else:
                 movement = 0.0
 
-            # Penalties
-            boundary = self.calculate_near_boundary_penalty(px, py)
-            recency  = float(np.mean(self.extract_recency_map(px, py))) * 75.0
+            # ── Penalties ─────────────────────────────────────────────────────────
+            recency      = float(np.mean(self.extract_recency_map(px, py)))
+            # Recency penalty is now purely additive, not mixed into exploration weight
+            recency_pen  = recency * 45.0
+
+            boundary     = self.calculate_near_boundary_penalty(px, py)
+            fire_cross   = self._w_risk * self.calculate_fire_crossing_penalty(px, py)
 
             reward += (
-                self._w_exploration    * exploration
-            + self._w_exploration_track    * fuel_track
-            + self._w_fire_discovery * fire_disc * step_advantage
-            + self._w_fire_tracking  * fire_track
-            + movement
-            - boundary
-            - recency
+                exploration
+                + fire_disc
+                + fuel_track
+                + perimeter_reward
+                + proximity
+                + movement
+                - recency_pen
+                - boundary
+                - fire_cross
             )
 
         return reward
@@ -523,18 +593,18 @@ class SingleAgentEnv(gym.Env):
 
         return total
     
-    def calculate_near_boundary_penalty(self, x, y):
-        margin = self.vp_size // 2  # start penalising half viewport-width from the edge ir when view hits edge
-        penalty = 0.0
-        for coord, limit in [(x, self.world_size[0]), (y, self.world_size[1])]:
-            # distance from each of the two walls for this axis
-            dist_low  = coord
-            dist_high = limit - coord
-            if dist_low < margin:
-                penalty += np.exp((margin - dist_low) / (margin / 3)) - 1
-            if dist_high < margin:
-                penalty += np.exp((margin - dist_high) / (margin / 3)) - 1
-        return 0.5 * penalty
+    # def calculate_near_boundary_penalty(self, x, y):
+    #     margin = self.vp_size // 2  # start penalising half viewport-width from the edge ir when view hits edge
+    #     penalty = 0.0
+    #     for coord, limit in [(x, self.world_size[0]), (y, self.world_size[1])]:
+    #         # distance from each of the two walls for this axis
+    #         dist_low  = coord
+    #         dist_high = limit - coord
+    #         if dist_low < margin:
+    #             penalty += np.exp((margin - dist_low) / (margin / 3)) - 1
+    #         if dist_high < margin:
+    #             penalty += np.exp((margin - dist_high) / (margin / 3)) - 1
+    #     return 0.5 * penalty
 
     def mark_recency_map(self, px, py):
         half = self.vp_size // 2
