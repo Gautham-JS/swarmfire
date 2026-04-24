@@ -347,7 +347,7 @@ def make_env_fn(cfg: Config, rank: int):
         env = SingleAgentEnv(
             n_agents        = cfg.n_agents,
             world_size      = cfg.world_size,
-            start_positions = [(256, 256)],
+            start_positions = [(cfg.world_size[0] // 2, cfg.world_size[1] // 2)],
             render_mode     = "rgb_array" if rank == 0 else "rgb_array",
             sample_interval = 10      if rank == 0 else 999999,
             save_interval   = 10      if rank == 0 else 999999,
@@ -359,9 +359,9 @@ def make_env_fn(cfg: Config, rank: int):
             phase_weights   = {
                 "exploration":    0.5,
                 "exploration_tracking": 0.1,
-                "fire_discovery": 16.8,
+                "fire_discovery": 18.8,
                 "fire_tracking":  12.5,
-                "risk":           2.0,
+                "risk":           1.5,
             },
             device=torch.device("cuda:1")
         )
