@@ -65,25 +65,15 @@ class HyperConnection(nn.Module):
         self.beta  = nn.Parameter(torch.ones(1, d_model))
 
     def forward(self, hidden_states: list[torch.Tensor], sublayer_out: torch.Tensor):
-        """
-        Args:
-            hidden_states: list of tensors [h_0, h_1, ..., h_{l-1}]
-                           each shape (B, 1, D) — all previous layer outputs
-                           including the original input embedding (h_0)
-            sublayer_out:  (B, 1, D) — output of FF sublayer for this layer
-        Returns:
-            (B, 1, D) mixed output
-        """
         assert len(hidden_states) == self.alpha.shape[0], \
-            f"Expected {self.alpha.shape[0]} hidden states, got {len(hidden_states)}"
+        f"Expected {self.alpha.shape[0]} hidden states, got {len(hidden_states)}"
 
-        # Softmax so mixing weights sum to 1 across inputs
-        weights = torch.softmax(self.alpha, dim=0)  # (n_inputs,)
+        weights = torch.softmax(self.alpha, dim=0)          # (n_inputs, d_model)
+        stacked = torch.stack(hidden_states, dim=0)          # (n_inputs, B, 1, d_model)
 
-        # Weighted sum of all previous hidden states
-        stacked = torch.stack(hidden_states, dim=0)    # (n_inputs, B, 1, D)
-        mixed   = (weights.view(-1, 1, 1, 1) * stacked).sum(dim=0)  # (B, 1, D)
-        # Add scaled sublayer contribution
+        # (n_inputs, d_model) → (n_inputs, 1, 1, d_model) to broadcast over B and seq dims
+        mixed = (weights.unsqueeze(1).unsqueeze(1) * stacked).sum(dim=0)  # (B, 1, d_model)
+
         return mixed + self.beta * sublayer_out
     
 
@@ -118,14 +108,13 @@ class TrXLBlock(nn.Module):
         attn_out, _ = self.attn(query=x_norm, key=kv, value=kv)
         attn_out    = torch.clamp(attn_out, -10.0, 10.0)
         self._check(attn_out, "Attention output")
+        
         x           = x + self.drop(attn_out)
 
         ff_out      = self.ff2(self.act(self.ff1(self.norm2(x))))
         self._check(x, "X first FF layer")
         ff_out      = torch.clamp(ff_out, -10.0, 10.0)
-        x           = x + self.drop(ff_out)
-        self._check(x, "X dropout layer")
-        return x
+        return x, ff_out
 
 
 
@@ -227,10 +216,10 @@ class TrXLExtractor(BaseFeaturesExtractor):
         # One HyperConnection per block
         # Layer 0 sees only h_0 (the input embedding)
         # Layer 1 sees h_0 and h_1 ...
-        # self.hyper_connections = nn.ModuleList([
-        #     HyperConnection(n_layers, self._d_model, layer_idx=i)
-        #     for i in range(n_layers)
-        # ])
+        self.hyper_connections = nn.ModuleList([
+            HyperConnection(n_layers, self._d_model, layer_idx=i)
+            for i in range(n_layers)
+        ])
 
         self.output_norm = nn.LayerNorm(self._d_model)
 
@@ -307,10 +296,17 @@ class TrXLExtractor(BaseFeaturesExtractor):
         # 6. TrXL blocks
         new_memory = []
         x = cur_token
-        for i, block in enumerate(self.blocks):
+        hidden_states = [x]
+        for i, (block, hyper_conns) in enumerate(zip(self.blocks, self.hyper_connections)):
             mem_input = (mem_tokens if i == 0 else self.memory[i][:B]) if use_memory else None
-            x = block(x, mem_input)
-            _check(x, f"TrXLBlock {i} output")
+            
+            _, ff_out = block(x, mem_input)
+            _check(ff_out, f"TrXLBlock {i} ff_out")
+
+            x = hyper_conns(hidden_states, ff_out)
+            _check(x, f"HyperConnection {i} output")
+
+            hidden_states.append(x)
 
             if use_memory:
                 updated = torch.cat(

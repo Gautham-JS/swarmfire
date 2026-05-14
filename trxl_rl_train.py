@@ -52,7 +52,7 @@ class Config:
     dropout:          float = 0.1
 
     # PPO
-    total_timesteps:  int   = 5_000_000
+    total_timesteps:  int   = 500_000
     n_steps:          int   = 512        # steps per env per rollout
                                          # total transitions = n_steps * n_envs one robot please and your customer service sucks. 
     batch_size:       int   = 256        # minibatch size for PPO update
@@ -76,7 +76,7 @@ class Config:
     n_eval_episodes:  int   = 5
 
     # WandB
-    wandb_project:    str   = "thesis-drl"
+    wandb_project:    str   = "thesis-drl-trxl"
     wandb_api_key:    str   = "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"
 
 
@@ -349,8 +349,8 @@ def make_env_fn(cfg: Config, rank: int):
             world_size      = cfg.world_size,
             start_positions = [(cfg.world_size[0] // 2, cfg.world_size[1] // 2)],
             render_mode     = "rgb_array" if rank == 0 else "rgb_array",
-            sample_interval = 10      if rank == 0 else 999999,
-            save_interval   = 10      if rank == 0 else 999999,
+            sample_interval = 100      if rank == 0 else 999999,
+            save_interval   = 100      if rank == 0 else 999999,
             seed            = cfg.seed + rank,   # different seed per env
             fixed_seed      = False,
             is_vid_out      = (rank == 0),
@@ -488,7 +488,7 @@ def train(cfg: Config, checkpoint_path=None):
     # Init memory — now batch_size = n_envs, one memory slice per env
     agent.extractor.init_memory(batch_size=cfg.n_envs, device=device)
 
-    print(f"[TRAIN] Starting — {cfg.total_timesteps:,} steps | "
+    print(f"[TRAIN] Starting - {cfg.total_timesteps:,} steps | "
           f"rollout size = {cfg.n_steps * cfg.n_envs:,} transitions")
     start_time = time.time()
 
@@ -675,7 +675,7 @@ def train(cfg: Config, checkpoint_path=None):
                     "count": reward_rms.count,
                 },
             }, ckpt_path)
-            print(f"[CKPT] Saved → {ckpt_path}")
+            print(f"[CKPT] Saved : {ckpt_path}")
             next_ckpt_step += cfg.checkpoint_freq
 
         # ── Evaluation ────────────────────────────────────────────────────────
@@ -693,7 +693,7 @@ def train(cfg: Config, checkpoint_path=None):
                     "global_step":      global_step,
                     "best_eval_reward": best_eval_reward,
                 }, os.path.join(cfg.best_model_dir, "best_model.pt"))
-                print(f"[EVAL] New best → {best_eval_reward:.3f}")
+                print(f"[EVAL] New best : {best_eval_reward:.3f}")
 
             # Re-init memory after eval clears it
             agent.extractor.init_memory(batch_size=cfg.n_envs, device=device)
@@ -717,7 +717,7 @@ def train(cfg: Config, checkpoint_path=None):
 # ─────────────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="CleanRL TrXL PPO — FireScout (parallel)")
+    parser = argparse.ArgumentParser(description="CleanRL TrXL PPO - FireScout (parallel)")
     parser.add_argument("-c", "--checkpoint", type=str, default=None)
     args = parser.parse_args()
 
