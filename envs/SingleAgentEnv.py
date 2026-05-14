@@ -156,8 +156,8 @@ class SingleAgentEnv(gym.Env):
     def reset(self, seed=None, options=None):
 
         if self._episode_count!=0 and self._episode_count % self.sample_int == 0:
-            print(f"[RESET] Episode {self._episode_count} ends: ")
-            print(f"[RESET] Reward history - MAX : {np.max(self._reward_history[10:])} | MEAN : {np.mean(self._reward_history[10:])} | MIN : {np.min(self._reward_history[10:])}")
+            if len(self._reward_history) > 10:
+                print(f"[RESET] Reward history - MAX : {np.max(self._reward_history[10:])} | MEAN : {np.mean(self._reward_history[10:])} | MIN : {np.min(self._reward_history[10:])}")
 
         # Clear episode state without destroying the video writer or figure
         self._obs_hsitory    = []

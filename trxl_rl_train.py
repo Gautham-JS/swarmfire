@@ -41,7 +41,7 @@ class Config:
     n_agents:         int   = 1
     iter_limit:       int   = 1024
     seed:             int   = 34
-    n_envs:           int   = 4          # ← parallel environments
+    n_envs:           int   = 4          # parallel environments
 
     # TrXL
     features_dim:     int   = 256
@@ -112,7 +112,7 @@ class RunningMeanStd:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Actor-Critic (unchanged from single-env version)
+# Actor-Critic
 # ─────────────────────────────────────────────────────────────────────────────
 
 class TrXLActorCritic(nn.Module):
@@ -159,7 +159,7 @@ class TrXLActorCritic(nn.Module):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Rollout buffer — parallel env version
+# Rollout buffer
 # ─────────────────────────────────────────────────────────────────────────────
 
 class TrXLRolloutBuffer:

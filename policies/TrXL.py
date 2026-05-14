@@ -7,6 +7,87 @@ import gymnasium as gym
 from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
 
 
+class GatingUnit(nn.Module):
+    """
+    GTrXL-style gating: learns when to update vs retain state.
+    
+    g = sigmoid(Wg * [x, sublayer_out] + bg)
+    out = g * sublayer_out + (1 - g) * x
+    
+    Resembles a GRU write gate — when g→1, new info dominates;
+    when g→0, existing state is preserved.
+    """
+    def __init__(self, d_model: int, gate_bias: float = -2.0):
+        super().__init__()
+        # Projects concatenated [x, sublayer_out] → gate vector
+        self.gate_linear = nn.Linear(d_model * 2, d_model)
+        # Negative bias init: gate starts near 0 → preserves existing state
+        # Network learns to open gates as training progresses
+        nn.init.constant_(self.gate_linear.bias, gate_bias)
+
+    def forward(self, x: torch.Tensor, sublayer_out: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x:            (B, 1, D) — current state (before sublayer)
+            sublayer_out: (B, 1, D) — output of attention or FF sublayer
+        Returns:
+            (B, 1, D) gated output
+        """
+        combined = torch.cat([x, sublayer_out], dim=-1)  # (B, 1, 2D)
+        g        = torch.sigmoid(self.gate_linear(combined))  # (B, 1, D)
+        return g * sublayer_out + (1.0 - g) * x
+
+
+class HyperConnection(nn.Module):
+    """
+    Learnable weighted residual mixing across all previous layer outputs.
+    
+    For layer l, the output is:
+        h_l = sum_i( alpha[i,l] * h_i ) + beta[l] * sublayer_out
+    
+    where h_0..h_{l-1} are all previous layer hidden states,
+    alpha controls how much each past state contributes,
+    and beta scales the new sublayer contribution.
+    
+    Args:
+        n_layers:  total number of transformer blocks
+        d_model:   model dimension
+        layer_idx: which layer this connection belongs to (0-indexed)
+    """
+    def __init__(self, n_layers: int, d_model: int, layer_idx: int):
+        super().__init__()
+        self.layer_idx = layer_idx
+        n_inputs       = layer_idx + 1  # input + all previous layers
+
+        # Optional: per-dimension mixing for richer expressivity
+        # Uncomment if you want full vector weights instead of scalars:
+        self.alpha = nn.Parameter(torch.zeros(n_inputs, d_model))
+        self.beta  = nn.Parameter(torch.ones(1, d_model))
+
+    def forward(self, hidden_states: list[torch.Tensor], sublayer_out: torch.Tensor):
+        """
+        Args:
+            hidden_states: list of tensors [h_0, h_1, ..., h_{l-1}]
+                           each shape (B, 1, D) — all previous layer outputs
+                           including the original input embedding (h_0)
+            sublayer_out:  (B, 1, D) — output of FF sublayer for this layer
+        Returns:
+            (B, 1, D) mixed output
+        """
+        assert len(hidden_states) == self.alpha.shape[0], \
+            f"Expected {self.alpha.shape[0]} hidden states, got {len(hidden_states)}"
+
+        # Softmax so mixing weights sum to 1 across inputs
+        weights = torch.softmax(self.alpha, dim=0)  # (n_inputs,)
+
+        # Weighted sum of all previous hidden states
+        stacked = torch.stack(hidden_states, dim=0)    # (n_inputs, B, 1, D)
+        mixed   = (weights.view(-1, 1, 1, 1) * stacked).sum(dim=0)  # (B, 1, D)
+        # Add scaled sublayer contribution
+        return mixed + self.beta * sublayer_out
+    
+
+
 class TrXLBlock(nn.Module):
     def __init__(self, d_model, n_heads, d_ff, dropout=0.1):
         super().__init__()
@@ -45,6 +126,9 @@ class TrXLBlock(nn.Module):
         x           = x + self.drop(ff_out)
         self._check(x, "X dropout layer")
         return x
+
+
+
 
 
 class SinusoidalTemporalEncoding(nn.Module):
@@ -117,9 +201,11 @@ class TrXLExtractor(BaseFeaturesExtractor):
         # ── Fusion ────────────────────────────────────────────────────────
         self.fusion = nn.Sequential(
             nn.Linear(cnn_out + 64, self._d_model * 2),
-            nn.LayerNorm(self._d_model * 2), nn.ReLU(),
+            nn.LayerNorm(self._d_model * 2), 
+            nn.ReLU(),
             nn.Linear(self._d_model * 2, self._d_model),
-            nn.LayerNorm(self._d_model),     nn.ReLU(),
+            nn.LayerNorm(self._d_model),     
+            nn.ReLU(),
         )
 
         # ── Spatial token encoding ────────────────────────────────────────
@@ -137,6 +223,14 @@ class TrXLExtractor(BaseFeaturesExtractor):
             TrXLBlock(self._d_model, n_heads, d_ff, dropout)
             for _ in range(n_layers)
         ])
+
+        # One HyperConnection per block
+        # Layer 0 sees only h_0 (the input embedding)
+        # Layer 1 sees h_0 and h_1 ...
+        # self.hyper_connections = nn.ModuleList([
+        #     HyperConnection(n_layers, self._d_model, layer_idx=i)
+        #     for i in range(n_layers)
+        # ])
 
         self.output_norm = nn.LayerNorm(self._d_model)
 
@@ -175,23 +269,18 @@ class TrXLExtractor(BaseFeaturesExtractor):
 
         # 1. CNN with spatial gating
         cnn_feat     = self.cnn(vp)
-        _check(cnn_feat, "cnn_feat")
 
         spatial_bias = self.pos_to_cnn_bias(pos)
         cnn_feat     = cnn_feat * torch.sigmoid(spatial_bias)
-        _check(cnn_feat, "cnn_feat after spatial gate")
 
         # 2. Position MLP
         pos_feat = self.pos_mlp(pos)
-        _check(pos_feat, "pos_feat")
 
         # 3. Fusion
         current = self.fusion(torch.cat([cnn_feat, pos_feat], dim=1))
-        _check(current, "fusion output")
 
         # 4. Spatial encoding
         current = current + self.token_spatial_encoding(pos)
-        _check(current, "after spatial encoding")
         current = current.unsqueeze(1)
 
         # 5. Memory logic (unchanged from before)
