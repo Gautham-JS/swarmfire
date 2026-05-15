@@ -115,7 +115,62 @@ class TrXLBlock(nn.Module):
         self._check(x, "X first FF layer")
         ff_out      = torch.clamp(ff_out, -10.0, 10.0)
         return x, ff_out
+    
 
+class TrXLSplitBlock(nn.Module):
+    def __init__(self, d_model, n_heads, d_ff, dropout=0.1, gate_bias=-2.0):
+        super().__init__()
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+        self.attn  = nn.MultiheadAttention(
+            d_model, n_heads,
+            dropout=dropout,
+            batch_first=True,
+        )
+        # Spectral norm on FF layers — constrains weight growth
+        self.ff1  = spectral_norm(nn.Linear(d_model, d_ff))
+        self.ff2  = spectral_norm(nn.Linear(d_ff, d_model))
+        self.act  = nn.ReLU()
+        self.drop = nn.Dropout(dropout)
+
+        self.attn_gate = GatingUnit(d_model, gate_bias)
+        self.ff_gate   = GatingUnit(d_model, gate_bias)
+    
+    def _check(self, tensor, name):
+        if torch.isnan(tensor).any():
+            raise RuntimeError(f"NaN detected in TrXLBlock at: {name}")
+        if torch.isinf(tensor).any():
+            raise RuntimeError(f"Inf detected in TrXLBlock at: {name}")
+        
+    def attn_sublayer(self, x, memory=None):
+        x_norm      = self.norm1(x)
+        self._check(x_norm, "norm1 output")
+        kv          = torch.cat([memory, x_norm], dim=1) if memory is not None else x_norm
+
+        attn_out, _ = self.attn(query=x_norm, key=kv, value=kv)
+        attn_out    = torch.clamp(self.drop(attn_out), -10.0, 10.0)
+        self._check(attn_out, "attn output")
+
+        gated = self.attn_gate(x, attn_out)
+        return gated
+
+    def ff_sublayer(self, x):
+        ff_out = self.ff2(self.act(self.ff1(self.norm2(x))))
+        ff_out = torch.clamp(ff_out, -10.0, 10.0)
+        self._check(ff_out, "ff output")
+
+        gated = self.ff_gate(x, ff_out)
+        return gated
+
+    def forward(self, x, memory=None):
+        x_norm      = self.norm1(x)
+        self._check(x_norm, "X norm1 output")
+        kv          = torch.cat([memory, x_norm], dim=1) if memory is not None else x_norm
+
+        attn_out, _ = self.attn(query=x_norm, key=kv, value=kv)
+        attn_out    = torch.clamp(attn_out, -10.0, 10.0)
+        self._check(attn_out, "Attention output")
+        return attn_out
 
 
 
@@ -209,14 +264,20 @@ class TrXLExtractor(BaseFeaturesExtractor):
         # ── Transformer-XL blocks ─────────────────────────────────────────
         d_ff = self._d_model * d_ff_multiplier
         self.blocks = nn.ModuleList([
-            TrXLBlock(self._d_model, n_heads, d_ff, dropout)
+            TrXLSplitBlock(self._d_model, n_heads, d_ff, dropout)
             for _ in range(n_layers)
         ])
 
         # One HyperConnection per block
         # Layer 0 sees only h_0 (the input embedding)
         # Layer 1 sees h_0 and h_1 ...
-        self.hyper_connections = nn.ModuleList([
+        self.hyper_connections_ff = nn.ModuleList([
+            HyperConnection(n_layers, self._d_model, layer_idx=i)
+            for i in range(n_layers)
+        ])
+
+        # New: one HyperConnection per block for the attention residual
+        self.hyper_connections_attn = nn.ModuleList([
             HyperConnection(n_layers, self._d_model, layer_idx=i)
             for i in range(n_layers)
         ])
@@ -297,13 +358,19 @@ class TrXLExtractor(BaseFeaturesExtractor):
         new_memory = []
         x = cur_token
         hidden_states = [x]
-        for i, (block, hyper_conns) in enumerate(zip(self.blocks, self.hyper_connections)):
+        for i, (block, attn_hyper_conns, ff_hyper_conns) in enumerate(zip(self.blocks, self.hyper_connections_attn, self.hyper_connections_ff)):
             mem_input = (mem_tokens if i == 0 else self.memory[i][:B]) if use_memory else None
             
-            _, ff_out = block(x, mem_input)
-            _check(ff_out, f"TrXLBlock {i} ff_out")
+            attn_out = block.attn_sublayer(x, mem_input)
+            _check(attn_out, f"TrXLBlock Attention layer {i}")
 
-            x = hyper_conns(hidden_states, ff_out)
+            x_attn = attn_hyper_conns(hidden_states, attn_out)
+            _check(x_attn, f"HyperConnection {i} output")
+
+            ff_out = block.ff_sublayer(x_attn)
+            _check(ff_out, f"TrXLBlock FeedForward layer {i}")
+
+            x = ff_hyper_conns(hidden_states, ff_out)
             _check(x, f"HyperConnection {i} output")
 
             hidden_states.append(x)

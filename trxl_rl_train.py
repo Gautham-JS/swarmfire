@@ -52,7 +52,7 @@ class Config:
     dropout:          float = 0.1
 
     # PPO
-    total_timesteps:  int   = 500_000
+    total_timesteps:  int   = 3_000_000
     n_steps:          int   = 512        # steps per env per rollout
                                          # total transitions = n_steps * n_envs one robot please and your customer service sucks. 
     batch_size:       int   = 256        # minibatch size for PPO update
@@ -374,7 +374,7 @@ def make_env_fn(cfg: Config, rank: int):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def evaluate(agent, cfg: Config, device, n_episodes=5):
-    eval_env   = make_env_fn(cfg, rank=99)()   # rank=99 → no rendering
+    eval_env   = make_env_fn(cfg, rank=99)()   # rank=99 - no rendering
     ep_rewards = []
 
     for _ in range(n_episodes):
