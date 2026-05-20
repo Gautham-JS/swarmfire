@@ -14,6 +14,7 @@ import os
 import time
 import argparse
 import random
+import json
 from collections import deque
 from dataclasses import dataclass, field
 
@@ -36,17 +37,19 @@ from policies.TrXL import TrXLExtractor
 
 @dataclass
 class Config:
+    run_id:           str   = None
+
     # Environment
     world_size:       tuple = (512, 512)
     n_agents:         int   = 1
     iter_limit:       int   = 1024
     seed:             int   = 34
-    n_envs:           int   = 4          # parallel environments
+    n_envs:           int   = 8          # parallel environments
 
     # TrXL
     features_dim:     int   = 256
     memory_len:       int   = 128
-    n_layers:         int   = 2
+    n_layers:         int   = 4
     n_heads:          int   = 4
     d_ff_multiplier:  int   = 2
     dropout:          float = 0.1
@@ -66,6 +69,15 @@ class Config:
     max_grad_norm:    float = 0.3
     target_kl:        float = 0.03
 
+    # Env weights
+    phase_weights:    dict  = {
+        "exploration":          0.2,
+        "exploration_tracking": 0.05,
+        "fire_discovery":       18.8,
+        "fire_tracking":        10.5,
+        "risk":                 1.5,
+    }
+
     # Checkpointing
     checkpoint_freq:  int   = 50_000
     checkpoint_dir:   str   = "./checkpoints"
@@ -78,6 +90,13 @@ class Config:
     # WandB
     wandb_project:    str   = "thesis-drl-trxl"
     wandb_api_key:    str   = "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"
+    
+    def dump_json(self, path, id):
+        data = json.dumps(self, default=lambda o: o.__dict__, sort_keys=True, indent=4)
+        with open(f'{path}/{id}.json', 'w', encoding='utf-8') as f:
+            json.dump(data, f, ensure_ascii=False, indent=4)
+
+
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -133,6 +152,11 @@ class TrXLActorCritic(nn.Module):
         self.actor_heads = nn.ModuleList([
             nn.Linear(cfg.features_dim, n) for n in action_nvec
         ])
+        self.critic_aggregator = nn.Sequential(
+            nn.Linear(cfg.features_dim * 2, cfg.features_dim),
+            nn.LayerNorm(cfg.features_dim),
+            nn.ReLU(),
+        )
         self.critic_head = nn.Linear(cfg.features_dim, 1)
 
         for head in self.actor_heads:
@@ -141,20 +165,44 @@ class TrXLActorCritic(nn.Module):
         nn.init.orthogonal_(self.critic_head.weight, gain=1.0)
         nn.init.zeros_(self.critic_head.bias)
 
-    def get_value(self, obs):
-        return self.critic_head(self.extractor(obs))
+    def _get_critic_features(self, features, memory_override=None):
+        """
+        Augments current features with a summary of recent memory.
+        Uses memory_override during PPO updates, self.extractor.memory during rollout.
+        """
+        # Use override if provided (PPO update), else fall back to rolling memory
+        memory = memory_override if memory_override is not None else self.extractor.memory
 
-    def get_action_and_value(self, obs, action=None):
-        features    = self.extractor(obs)
+        if memory is None:
+            return features
+
+        # Mean-pool last layer's memory: (B, memory_len, D) → (B, D)
+        mem_summary = memory[-1].mean(dim=1)
+
+        # Guard against batch size mismatch (safety check)
+        if mem_summary.shape[0] != features.shape[0]:
+            return features
+
+        combined = torch.cat([features, mem_summary], dim=-1)  # (B, 2D)
+        return self.critic_aggregator(combined)                 # (B, D)
+
+    def get_value(self, obs, memory_override=None):
+        features        = self.extractor(obs, memory_override=memory_override)
+        critic_features = self._get_critic_features(features, memory_override=memory_override)
+        return self.critic_head(critic_features)
+
+    def get_action_and_value(self, obs, action=None, memory_override=None):
+        features    = self.extractor(obs, memory_override=memory_override)
         logits_list = [head(features) for head in self.actor_heads]
         dists       = [Categorical(logits=l) for l in logits_list]
 
         if action is None:
             action = torch.stack([d.sample() for d in dists], dim=1)
 
-        log_prob = sum(d.log_prob(action[:, i]) for i, d in enumerate(dists))
-        entropy  = sum(d.entropy() for d in dists)
-        value    = self.critic_head(features)
+        log_prob        = sum(d.log_prob(action[:, i]) for i, d in enumerate(dists))
+        entropy         = sum(d.entropy() for d in dists)
+        critic_features = self._get_critic_features(features, memory_override=memory_override)
+        value           = self.critic_head(critic_features)
         return action, log_prob, entropy, value
 
 
@@ -356,13 +404,7 @@ def make_env_fn(cfg: Config, rank: int):
             is_vid_out      = (rank == 0),
             vid_id          = f"firescout_env{rank}",
             vid_base_path   = "/home/s3400220/swarmfire/vids_parallel/",
-            phase_weights   = {
-                "exploration":    0.5,
-                "exploration_tracking": 0.1,
-                "fire_discovery": 18.8,
-                "fire_tracking":  12.5,
-                "risk":           1.5,
-            },
+            phase_weights   = cfg.phase_weights,
             device=torch.device("cuda:1")
         )
         return TimeLimit(env, max_episode_steps=cfg.iter_limit)
@@ -373,15 +415,17 @@ def make_env_fn(cfg: Config, rank: int):
 # Evaluation (single env, same as before)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def evaluate(agent, cfg: Config, device, n_episodes=5):
-    eval_env   = make_env_fn(cfg, rank=99)()   # rank=99 - no rendering
+def evaluate(agent, cfg, device, n_episodes=5):
+    eval_env   = make_env_fn(cfg, rank=99)()
     ep_rewards = []
 
     for _ in range(n_episodes):
         obs, _    = eval_env.reset()
         done      = False
         ep_reward = 0.0
-        agent.extractor.memory = None   # fresh memory per episode
+        # Full reset including staging buffer
+        agent.extractor.memory           = None
+        agent.extractor._segment_hiddens = None
 
         while not done:
             obs_t = single_obs_to_tensor(obs, device)
@@ -396,7 +440,8 @@ def evaluate(agent, cfg: Config, device, n_episodes=5):
         ep_rewards.append(ep_reward)
 
     eval_env.close()
-    agent.extractor.memory = None
+    agent.extractor.memory           = None
+    agent.extractor._segment_hiddens = None
     return float(np.mean(ep_rewards))
 
 
@@ -409,6 +454,10 @@ def train(cfg: Config, checkpoint_path=None):
     # ── Setup ─────────────────────────────────────────────────────────────────
     os.environ["WANDB_API_KEY"] = cfg.wandb_api_key
     wandb.init(project=cfg.wandb_project, config=vars(cfg))
+
+    cfg.run_id = wandb.run.name
+
+    print(f"[Train] : Begin training session with ID : {cfg.run_id}")
 
     os.makedirs(cfg.checkpoint_dir, exist_ok=True)
     os.makedirs(cfg.best_model_dir, exist_ok=True)
@@ -559,8 +608,8 @@ def train(cfg: Config, checkpoint_path=None):
 
         # ── Compute GAE ───────────────────────────────────────────────────────
         with torch.no_grad():
-            obs_t      = vec_obs_to_tensor(obs_dict, device)
-            last_values = agent.get_value(obs_t).squeeze(-1).cpu().numpy()  # (n_envs,)
+            obs_t       = vec_obs_to_tensor(obs_dict, device)
+            last_values = agent.get_value(obs_t, memory_override=None).squeeze(-1).cpu().numpy()
 
         buffer.compute_gae(
             last_values = last_values,
@@ -568,9 +617,6 @@ def train(cfg: Config, checkpoint_path=None):
         )
 
         # ── PPO update ────────────────────────────────────────────────────────
-        if agent.extractor.memory is not None:
-            agent.extractor.memory = [m.detach() for m in agent.extractor.memory]
-
         agent.train()
 
         policy_losses, value_losses, entropies, kl_divs = [], [], [], []
@@ -580,19 +626,18 @@ def train(cfg: Config, checkpoint_path=None):
             if stop_early:
                 break
 
+           # ── PPO update loop (replace existing inner loop) ────────────────────────
             for (obs_b, actions_b, old_log_probs_b,
-                 advantages_b, returns_b, old_values_b,
-                 memory_b) in buffer.get_minibatches(cfg.batch_size):
-
-                # Inject stored per-(step, env) memory snapshot
-                # memory_b is a list of (batch_size, memory_len, d_model) tensors
-                # — one entry per layer, already on device
-                agent.extractor.memory = memory_b
+                advantages_b, returns_b, old_values_b,
+                memory_b) in buffer.get_minibatches(cfg.batch_size):
 
                 advantages_b = (advantages_b - advantages_b.mean()) / (advantages_b.std() + 1e-8)
 
+                # Passing memory_b as override — rolling memory is NOT touched
                 _, new_log_probs, entropy, new_values = agent.get_action_and_value(
-                    obs_b, action=actions_b
+                    obs_b,
+                    action=actions_b,
+                    memory_override=memory_b,    # : key change
                 )
                 new_values = new_values.squeeze(-1)
 
@@ -630,8 +675,16 @@ def train(cfg: Config, checkpoint_path=None):
         # Restore live memory for next rollout collection
         # Memory slices that were mid-episode are preserved correctly —
         # only done envs had their slices zeroed during collection
-        agent.extractor.memory = None
-        agent.extractor.init_memory(batch_size=cfg.n_envs, device=device)
+        # agent.extractor.memory = None
+        # agent.extractor.init_memory(batch_size=cfg.n_envs, device=device)
+
+        agent.extractor.memory = [
+            m.detach() for m in agent.extractor.memory
+        ]
+        if agent.extractor._segment_hiddens is not None:
+            agent.extractor._segment_hiddens = [
+                h.detach() for h in agent.extractor._segment_hiddens
+            ]
 
         # ── Logging ───────────────────────────────────────────────────────────
         elapsed  = time.time() - start_time
@@ -675,6 +728,9 @@ def train(cfg: Config, checkpoint_path=None):
                     "count": reward_rms.count,
                 },
             }, ckpt_path)
+
+            cfg.dump_json(cfg.checkpoint_dir, cfg.run_id)
+
             print(f"[CKPT] Saved : {ckpt_path}")
             next_ckpt_step += cfg.checkpoint_freq
 
