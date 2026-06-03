@@ -87,9 +87,8 @@ void ADroneParent::OnPCGGenerationComplete(UPCGComponent* comp) {
 
 // Called when the game starts or when spawned
 void ADroneParent::BeginPlay() {
-	Super::BeginPlay();
-
-	UE_LOG(LogTemp, Warning, TEXT("[DRONE] <BeginPlay> - Enter"));
+    Super::BeginPlay();
+    UE_LOG(LogTemp, Warning, TEXT("[DRONE] <BeginPlay> - Enter"));
 	if (this->rgb_render_target) {
 		this->down_cap->TextureTarget = this->rgb_render_target;
 		if (GEngine)

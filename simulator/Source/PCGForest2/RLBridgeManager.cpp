@@ -20,17 +20,12 @@ void URLBridgeManager::Connect(const FString& url) {
     if (!FModuleManager::Get().IsModuleLoaded(TEXT("WebSockets")))
         FModuleManager::Get().LoadModule(TEXT("WebSockets"));
 
-    this->socket = FWebSocketsModule::Get()
-        .CreateWebSocket(url, TEXT("ws"));
+    this->socket = FWebSocketsModule::Get().CreateWebSocket(url, TEXT("ws"));
 
-    this->socket->OnConnected().AddUObject(
-        this, &URLBridgeManager::HandleConnected);
-    this->socket->OnConnectionError().AddUObject(
-        this, &URLBridgeManager::HandleError);
-    this->socket->OnClosed().AddUObject(
-        this, &URLBridgeManager::HandleClosed);
-    this->socket->OnMessage().AddUObject(
-        this, &URLBridgeManager::HandleMessage);
+    this->socket->OnConnected().AddUObject(this, &URLBridgeManager::HandleConnected);
+    this->socket->OnConnectionError().AddUObject(this, &URLBridgeManager::HandleError);
+    this->socket->OnClosed().AddUObject(this, &URLBridgeManager::HandleClosed);
+    this->socket->OnMessage().AddUObject(this, &URLBridgeManager::HandleMessage);
 
     this->socket->Connect();
 
@@ -60,14 +55,14 @@ void URLBridgeManager::SendObservation(
     root->SetNumberField(TEXT("step_id"), step_id);
     root->SetBoolField(TEXT("done"), episode_done);
 
-    // ── Segmentation mask ─────────────────────────────────────────
+    // Segmentation mask 
     root->SetStringField(TEXT("seg_b64"), EncodeRT(seg_rt));
     root->SetNumberField(TEXT("seg_w"),
         seg_rt ? seg_rt->SizeX : 512);
     root->SetNumberField(TEXT("seg_h"),
         seg_rt ? seg_rt->SizeY : 512);
 
-    // ── Drone state ───────────────────────────────────────────────
+    // Drone state
     TSharedPtr<FJsonObject> state = MakeShareable(new FJsonObject);
     state->SetNumberField(TEXT("norm_x"), norm_pos.X);
     state->SetNumberField(TEXT("norm_y"), norm_pos.Y);
@@ -76,7 +71,7 @@ void URLBridgeManager::SendObservation(
     state->SetBoolField(TEXT("inside"), inside_pcg);
     root->SetObjectField(TEXT("state"), state);
 
-    // ── Volume / camera params ────────────────────────────────────
+    // Volume / camera params
     TSharedPtr<FJsonObject> params = MakeShareable(new FJsonObject);
     params->SetNumberField(TEXT("vol_size_x"), vol_size_uu.X);
     params->SetNumberField(TEXT("vol_size_y"), vol_size_uu.Y);
@@ -84,7 +79,7 @@ void URLBridgeManager::SendObservation(
     params->SetNumberField(TEXT("fov_deg"), fov_degrees);
     root->SetObjectField(TEXT("camera_params"), params);
 
-    // ── Fire positions ────────────────────────────────────────────
+    // Fire positions
     TArray<TSharedPtr<FJsonValue>> fire_arr;
     for (const FVector2D& fp : fire_norm_positions) {
         TSharedPtr<FJsonObject> fobj = MakeShareable(new FJsonObject);
@@ -183,15 +178,12 @@ void URLBridgeManager::HandleMessage(const FString& message) {
     TSharedRef<TJsonReader<>> r =
         TJsonReaderFactory<>::Create(message);
 
-    if (!FJsonSerializer::Deserialize(r, json) || !json.IsValid())
-        return;
+    if (!FJsonSerializer::Deserialize(r, json) || !json.IsValid()) return;
 
     FString type = json->GetStringField(TEXT("type"));
 
-    if (type == TEXT("action"))
-        ParseAction(json);
-    else if (type == TEXT("reset"))
-        ParseReset(json);
+    if (type == TEXT("action")) ParseAction(json);
+    else if (type == TEXT("reset")) ParseReset(json);
     else if (type == TEXT("ping")) {
         TSharedPtr<FJsonObject> pong = MakeShareable(new FJsonObject);
         pong->SetStringField(TEXT("type"), TEXT("pong"));
