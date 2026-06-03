@@ -36,7 +36,7 @@ def join_mp4s(input_dir: str, output_dir: str, output_name: str = "joined.mp4"):
     height = int(first.get(cv2.CAP_PROP_FRAME_HEIGHT))
     first.release()
 
-    print(f"\nOutput: {width}x{height} @ {fps:.2f}fps → {output_path}")
+    print(f"\nOutput: {width}x{height} @ {fps:.2f}fps - {output_path}")
 
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
     writer = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
@@ -50,7 +50,7 @@ def join_mp4s(input_dir: str, output_dir: str, output_name: str = "joined.mp4"):
     for mp4_path in mp4_files:
         cap = cv2.VideoCapture(mp4_path)
         if not cap.isOpened():
-            print(f"  Skipping {os.path.basename(mp4_path)} — could not open")
+            print(f"  Skipping {os.path.basename(mp4_path)} - could not open")
             continue
 
         file_frames = 0

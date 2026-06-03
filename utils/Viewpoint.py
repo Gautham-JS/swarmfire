@@ -184,3 +184,13 @@ class IncrementalViewAccumulator:
     def reset(self):
         self.scene[:] = 0.0
         self.visited[:] = False
+
+
+
+def get_coverage_percentage(idx: int, map: np.ndarray, accumulated_view: np.ndarray):
+    total = np.sum(map[:, :, idx])
+    covered = np.sum(accumulated_view[:, :, idx])
+    return float(covered / total * 100)
+
+
+

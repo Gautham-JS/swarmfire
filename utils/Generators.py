@@ -68,6 +68,7 @@ class AgentGenerators:
 class FuelMapGenerator:
     def __init__(self, size):
         self.size = size
+        self.fire_gen = FireClusterMapGenerator(self.size)
     
     from scipy.ndimage import gaussian_filter
     from skimage.morphology import dilation, disk
@@ -286,6 +287,7 @@ class FuelMapGenerator:
         world_map = np.zeros((self.size[0], self.size[0], 2), dtype=np.float32)
 
         fire_masks, wind_vectors = self.generate_fire_perimeter_timeseries(self.size, 1, width_mean=2, fronts_per_step=10, edge_sigma=0.5, growth_rate=0.03, wind_strength=1.0, seed=seed, num_regions=3)
+        # fire_masks = self.fire_gen.create_map(seed=seed)
         fire_mask = fire_masks[0]
         
         w = 0.7
@@ -368,3 +370,258 @@ class PathGenerator:
 
     def generate_bezier(self, layer, points):
         return generate_bezier_path(layer, points)
+    
+
+
+
+import numpy as np
+from scipy.ndimage import gaussian_filter, binary_dilation
+from noise import pnoise2   # pip install noise
+
+
+class FireClusterMapGenerator:
+    """
+    Generates maps with spread-out fire clusters in varied shapes:
+      - Noisy rings / annuli
+      - Irregular blobs (Perlin-masked ellipses)
+      - Arc segments (partial rings)
+      - Streak clusters (wind-driven appearance)
+    
+    Each map has 2 channels: [:,:,0] = fuel, [:,:,1] = fire.
+    Fuel is generated independently via Perlin noise.
+    """
+
+    def __init__(self, world_size: tuple[int, int]):
+        self.H, self.W = world_size
+
+    def create_map(self, seed=None) -> np.ndarray:
+        rng = np.random.default_rng(seed)
+
+        # map_out = np.zeros((self.H, self.W, 2), dtype=np.float32)
+        # # map_out[:, :, 0] = self._generate_fuel(seed)
+        # map_out[:, :, 1] = self._generate_fire_clusters(rng)
+
+        # # Fire only burns where there is fuel
+        # map_out[:, :, 1] *= (map_out[:, :, 0] > 0.2).astype(np.float32)
+
+        return self._generate_fire_clusters(rng)
+
+    # ── Fuel ──────────────────────────────────────────────────────────────────
+
+    def _generate_fuel(self, seed) -> np.ndarray:
+        """Smooth Perlin fuel map, values in [0, 1]."""
+        seed = seed or 0
+        scale = 0.003
+        fuel = np.array([
+            [pnoise2(x * scale + seed, y * scale + seed, octaves=4)
+             for y in range(self.W)]
+            for x in range(self.H)
+        ], dtype=np.float32)
+        # Normalise to [0, 1]
+        fuel = (fuel - fuel.min()) / (fuel.max() - fuel.min() + 1e-8)
+        return fuel
+
+    # ── Fire cluster orchestration ────────────────────────────────────────────
+
+    def _generate_fire_clusters(self, rng: np.random.Generator) -> np.ndarray:
+        fire = np.zeros((self.H, self.W), dtype=np.float32)
+
+        n_clusters = int(rng.integers(8, 16))
+
+        # Spread cluster centres across the map using a simple repulsion grid
+        centres = self._sample_spread_centres(rng, n_clusters, min_sep=180)
+
+        for cx, cy in centres:
+            style = rng.choice(["ring", "arc", "blob", "streak"], p=[0.35, 0.25, 0.25, 0.15])
+
+            if style == "ring":
+                patch = self._make_noisy_ring(rng, cx, cy)
+            elif style == "arc":
+                patch = self._make_arc(rng, cx, cy)
+            elif style == "blob":
+                patch = self._make_blob(rng, cx, cy)
+            else:
+                patch = self._make_streak(rng, cx, cy)
+
+            fire = np.maximum(fire, patch)
+
+        # Light global Perlin mask so fire intensity varies spatially
+        perlin_mask = self._perlin_mask(rng)
+        fire = fire * (0.6 + 0.4 * perlin_mask)
+
+        # Threshold and smooth edges
+        fire = (fire > 0.3).astype(np.float32)
+        fire = gaussian_filter(fire, sigma=1.5)
+        fire = np.clip(fire / (fire.max() + 1e-8), 0, 1)
+        fire = (fire > 0.4).astype(np.float32)
+
+        return fire
+
+    # ── Centre sampling ───────────────────────────────────────────────────────
+
+    def _sample_spread_centres(self, rng, n, min_sep):
+        """
+        Sample n centres with a minimum separation using rejection sampling.
+        Falls back gracefully if it can't place all n points.
+        """
+        margin  = 150
+        centres = []
+        max_attempts = 500
+
+        for _ in range(n):
+            for _ in range(max_attempts):
+                x = int(rng.integers(margin, self.H - margin))
+                y = int(rng.integers(margin, self.W - margin))
+                if all(np.sqrt((x - cx)**2 + (y - cy)**2) >= min_sep
+                       for cx, cy in centres):
+                    centres.append((x, y))
+                    break
+
+        return centres
+
+    # ── Ring ─────────────────────────────────────────────────────────────────
+
+    def _make_noisy_ring(self, rng, cx, cy) -> np.ndarray:
+        """
+        Annulus with Perlin-noise radius perturbation — looks like a
+        fire front that has propagated outward from an ignition point.
+        """
+        radius     = float(rng.integers(20, 80))
+        thickness  = float(rng.integers(6, 35))
+        noise_amp  = radius * rng.uniform(0.15, 0.45)  # how ragged the ring is
+        noise_freq = rng.uniform(0.03, 0.08)
+        seed_off   = float(rng.integers(0, 10000))
+
+        ys, xs = np.ogrid[:self.H, :self.W]
+        dx = xs - cy
+        dy = ys - cx
+        angles = np.arctan2(dy, dx)           # (H, W)
+        dist   = np.sqrt(dx**2 + dy**2)      # (H, W)
+
+        # Perturb the target radius by a smooth noise function of angle
+        # Use vectorised sin/cos series as a cheap angle-domain noise proxy
+        n_harmonics = 6
+        perturb = np.zeros_like(angles)
+        for k in range(1, n_harmonics + 1):
+            phase = float(rng.uniform(0, 2 * np.pi))
+            amp   = noise_amp / k
+            perturb += amp * np.sin(k * angles + phase)
+
+        target_radius = radius + perturb       # (H, W) — varies per angle
+        ring = np.abs(dist - target_radius) < (thickness / 2)
+
+        out = np.zeros((self.H, self.W), dtype=np.float32)
+        out[ring] = 1.0
+        return out
+
+    # ── Arc ───────────────────────────────────────────────────────────────────
+
+    def _make_arc(self, rng, cx, cy) -> np.ndarray:
+        """Partial ring — like a fire that has spread in one wind direction."""
+        radius     = float(rng.integers(50, 140))
+        thickness  = float(rng.integers(10, 28))
+        arc_start  = float(rng.uniform(0, 2 * np.pi))
+        arc_span   = float(rng.uniform(np.pi * 0.4, np.pi * 1.4))
+        noise_amp  = radius * rng.uniform(0.1, 0.3)
+
+        ys, xs     = np.ogrid[:self.H, :self.W]
+        dx = xs - cy
+        dy = ys - cx
+        angles = np.arctan2(dy, dx) % (2 * np.pi)
+        dist   = np.sqrt(dx**2 + dy**2)
+
+        # Noisy radius, same harmonic approach as ring
+        n_harmonics = 4
+        perturb = np.zeros_like(angles)
+        for k in range(1, n_harmonics + 1):
+            phase    = float(rng.uniform(0, 2 * np.pi))
+            perturb += (noise_amp / k) * np.sin(k * angles + phase)
+
+        target_radius = radius + perturb
+        in_band       = np.abs(dist - target_radius) < (thickness / 2)
+
+        # Angular mask for the arc segment
+        arc_end = (arc_start + arc_span) % (2 * np.pi)
+        if arc_end > arc_start:
+            in_arc = (angles >= arc_start) & (angles <= arc_end)
+        else:
+            in_arc = (angles >= arc_start) | (angles <= arc_end)
+
+        out = np.zeros((self.H, self.W), dtype=np.float32)
+        out[in_band & in_arc] = 1.0
+        return out
+
+    # ── Blob ─────────────────────────────────────────────────────────────────
+
+    def _make_blob(self, rng, cx, cy) -> np.ndarray:
+        """
+        Irregular elliptical blob masked by Perlin noise —
+        looks like a ground fire spreading through patchy fuel.
+        """
+        rx = float(rng.integers(30, 100))
+        ry = float(rng.integers(30, 100))
+        angle = float(rng.uniform(0, np.pi))
+
+        ys, xs = np.ogrid[:self.H, :self.W]
+        dx = xs - cy
+        dy = ys - cx
+
+        cos_a, sin_a = np.cos(angle), np.sin(angle)
+        rx_rot =  cos_a * dx + sin_a * dy
+        ry_rot = -sin_a * dx + cos_a * dy
+        ellipse = ((rx_rot / rx)**2 + (ry_rot / ry)**2) <= 1.0
+
+        # Perlin mask to break up the ellipse interior
+        perlin = self._perlin_mask(rng, freq=0.015)
+        threshold = rng.uniform(0.3, 0.55)
+
+        out = np.zeros((self.H, self.W), dtype=np.float32)
+        out[ellipse & (perlin > threshold)] = 1.0
+        return out
+
+    # ── Streak ────────────────────────────────────────────────────────────────
+
+    def _make_streak(self, rng, cx, cy) -> np.ndarray:
+        """
+        Wind-driven elongated fire — a rotated, tapered ellipse
+        with noisy edges, wider at the origin and narrowing downwind.
+        """
+        length    = float(rng.integers(80, 220))
+        width     = float(rng.integers(15,  45))
+        direction = float(rng.uniform(0, 2 * np.pi))
+
+        ys, xs = np.ogrid[:self.H, :self.W]
+        dx = xs - cy
+        dy = ys - cx
+
+        cos_d, sin_d = np.cos(direction), np.sin(direction)
+        along  =  cos_d * dx + sin_d * dy   # distance along wind direction
+        across = -sin_d * dx + cos_d * dy   # distance across wind direction
+
+        # Taper: width narrows linearly from base to tip
+        taper_ratio = np.clip(1.0 - along / (length + 1e-8), 0.1, 1.0)
+        in_streak   = (
+            (along >= 0) & (along <= length) &
+            (np.abs(across) <= width * taper_ratio)
+        )
+
+        # Noisy boundary
+        noise = self._perlin_mask(rng, freq=0.02)
+        out   = np.zeros((self.H, self.W), dtype=np.float32)
+        out[in_streak] = 1.0
+        out = out * (0.5 + 0.5 * noise)
+        out = (out > 0.4).astype(np.float32)
+        return out
+
+    # ── Perlin mask helper ────────────────────────────────────────────────────
+
+    def _perlin_mask(self, rng, freq=0.008) -> np.ndarray:
+        """Returns a (H, W) Perlin noise array normalised to [0, 1]."""
+        seed_off = float(rng.integers(0, 100000))
+        arr = np.array([
+            [pnoise2((x + seed_off) * freq, (y + seed_off) * freq, octaves=3)
+             for y in range(self.W)]
+            for x in range(self.H)
+        ], dtype=np.float32)
+        arr = (arr - arr.min()) / (arr.max() - arr.min() + 1e-8)
+        return arr

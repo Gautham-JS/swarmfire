@@ -1,20 +1,32 @@
 """
-CleanRL-style PPO with TrXL memory snapshot support — 4 parallel environments.
+CleanRL-style Recurrent PPO (LSTM hidden-state memory) — parallel environments.
 
-Key changes from single-env version:
-  1. SubprocVecEnv runs N envs in separate processes simultaneously.
-  2. TrXL memory is now shaped (N, memory_len, d_model) — one slice per env.
-  3. Memory snapshots in the buffer store per-env slices at each step.
-  4. Episode done handling resets only the finished env's memory slice.
-  5. GAE is computed across the (n_steps, N) transition grid.
-  6. Minibatch indexing uses flat (step * N + env) indices.
+Recurrent PPO baseline for the TrXL version:
+  • Same environment, same SubprocVecEnv setup.
+  • Same WandB logging (all episode/train/eval/scatter metrics).
+  • Same reward normalisation, checkpointing, evaluation.
+  • Memory model: single-layer LSTM whose hidden state (h, c) is carried
+    between steps, reset on episode done — exactly mirroring the TrXL
+    memory reset logic.
+  • GAE is computed per-sequence (the full rollout per env), NOT shuffled
+    across envs — this is the standard recurrent PPO approach.  Minibatches
+    are whole env-sequences of length n_steps, keeping temporal order intact.
+
+Key design decisions vs standard PPO:
+  1. Hidden state (h, c) is stored at EACH step as a snapshot, so we can
+     replay the exact hidden state during the PPO update (avoids stale-state
+     bias).  Shape: (n_steps, n_envs, lstm_hidden).
+  2. During the PPO update, for each env-sequence we feed obs step-by-step
+     into the LSTM starting from the stored initial hidden (step 0 snapshot).
+     This gives correct gradient flow through time.
+  3. Minibatch = one full env-sequence (n_steps steps).  n_envs env-sequences
+     are shuffled and grouped into batches of `batch_envs` sequences.
 """
 
 import os
 import time
 import argparse
 import random
-import json
 from collections import deque
 from dataclasses import dataclass, field
 
@@ -28,7 +40,7 @@ import wandb
 from gymnasium.wrappers import TimeLimit
 from stable_baselines3.common.vec_env import SubprocVecEnv
 from envs.SingleAgentEnv import SingleAgentEnv
-from policies.TrXL import TrXLExtractor
+from envs.IsolatedAgent import IsolatedAgentEnv
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -44,21 +56,17 @@ class Config:
     n_agents:         int   = 1
     iter_limit:       int   = 512
     seed:             int   = None
-    n_envs:           int   = 8          # parallel environments
+    n_envs:           int   = 8
 
-    # TrXL
-    features_dim:     int   = 256
-    memory_len:       int   = 128
-    n_layers:         int   = 4
-    n_heads:          int   = 4
-    d_ff_multiplier:  int   = 2
-    dropout:          float = 0.1
+    # Network
+    features_dim:     int   = 256        # CNN/MLP embedding size
+    hidden_dim:       int   = 512        # MLP hidden before LSTM
+    lstm_hidden:      int   = 256        # LSTM hidden size (matches features_dim)
 
-    # PPO
+    # PPO (mirrors TrXL config)
     total_timesteps:  int   = 2_000_000
     n_steps:          int   = 512        # steps per env per rollout
-                                         # total transitions = n_steps * n_envs. 
-    batch_size:       int   = 256        # minibatch size for PPO update
+    batch_envs:       int   = 2          # env-sequences per minibatch (≈ batch_size / n_steps)
     n_epochs:         int   = 10
     learning_rate:    float = 1e-4
     gamma:            float = 0.99
@@ -80,8 +88,8 @@ class Config:
 
     # Checkpointing
     checkpoint_freq:  int   = 50_000
-    checkpoint_dir:   str   = "./checkpoints"
-    best_model_dir:   str   = "./best_model"
+    checkpoint_dir:   str   = "./checkpoints_rppo"
+    best_model_dir:   str   = "./best_model_rppo"
 
     # Evaluation
     eval_freq:        int   = 50_000
@@ -92,10 +100,8 @@ class Config:
     wandb_api_key:    str   = "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"
 
 
-
-
 # ─────────────────────────────────────────────────────────────────────────────
-# Running reward normaliser (one per env, averaged)
+# Running reward normaliser
 # ─────────────────────────────────────────────────────────────────────────────
 
 class RunningMeanStd:
@@ -105,20 +111,18 @@ class RunningMeanStd:
         self.count = epsilon
 
     def update(self, x):
-        # x can be a scalar or array of rewards from multiple envs
         x           = np.asarray(x, dtype=np.float64)
         batch_mean  = float(np.mean(x))
         batch_var   = float(np.var(x))
         batch_count = x.size
-
-        total      = self.count + batch_count
-        delta      = batch_mean - self.mean
-        self.mean  = self.mean + delta * batch_count / total
-        self.var   = (
+        total       = self.count + batch_count
+        delta       = batch_mean - self.mean
+        self.mean   = self.mean + delta * batch_count / total
+        self.var    = (
             self.count * self.var + batch_count * batch_var
             + delta ** 2 * self.count * batch_count / total
         ) / total
-        self.count = total
+        self.count  = total
 
     def normalise(self, x, clip=10.0):
         normed = (np.asarray(x) - self.mean) / (np.sqrt(self.var) + 1e-8)
@@ -126,33 +130,51 @@ class RunningMeanStd:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Actor-Critic
+# Recurrent Actor-Critic  (MLP encoder → LSTM → actor/critic heads)
 # ─────────────────────────────────────────────────────────────────────────────
 
-class TrXLActorCritic(nn.Module):
+class LSTMActorCritic(nn.Module):
+    """
+    Architecture:
+      obs dict  →  flatten  →  MLP encoder  →  LSTM  →  actor / critic heads
+
+    The LSTM hidden state (h, c) is maintained externally by the training loop
+    so that it can be snapshotted and replayed during the PPO update.
+    """
+
     def __init__(self, observation_space, action_nvec, cfg: Config):
         super().__init__()
+        self.cfg          = cfg
+        self.action_nvec  = action_nvec
+        self.lstm_hidden  = cfg.lstm_hidden
 
-        self.extractor = TrXLExtractor(
-            observation_space,
-            features_dim    = cfg.features_dim,
-            memory_len      = cfg.memory_len,
-            n_layers        = cfg.n_layers,
-            n_heads         = cfg.n_heads,
-            d_ff_multiplier = cfg.d_ff_multiplier,
-            dropout         = cfg.dropout,
+        # Compute flat obs size
+        total_in = sum(
+            int(np.prod(sp.shape))
+            for sp in observation_space.spaces.values()
         )
+        self.obs_keys = sorted(observation_space.spaces.keys())
 
-        self.action_nvec = action_nvec
-        self.actor_heads = nn.ModuleList([
-            nn.Linear(cfg.features_dim, n) for n in action_nvec
-        ])
-        self.critic_aggregator = nn.Sequential(
-            nn.Linear(cfg.features_dim * 2, cfg.features_dim),
+        self.encoder = nn.Sequential(
+            nn.Linear(total_in, cfg.hidden_dim),
+            nn.LayerNorm(cfg.hidden_dim),
+            nn.ReLU(),
+            nn.Linear(cfg.hidden_dim, cfg.features_dim),
             nn.LayerNorm(cfg.features_dim),
             nn.ReLU(),
         )
-        self.critic_head = nn.Linear(cfg.features_dim, 1)
+
+        self.lstm = nn.LSTM(
+            input_size  = cfg.features_dim,
+            hidden_size = cfg.lstm_hidden,
+            num_layers  = 1,
+            batch_first = True,   # (B, T, features_dim)
+        )
+
+        self.actor_heads = nn.ModuleList([
+            nn.Linear(cfg.lstm_hidden, n) for n in action_nvec
+        ])
+        self.critic_head = nn.Linear(cfg.lstm_hidden, 1)
 
         for head in self.actor_heads:
             nn.init.orthogonal_(head.weight, gain=0.01)
@@ -160,134 +182,151 @@ class TrXLActorCritic(nn.Module):
         nn.init.orthogonal_(self.critic_head.weight, gain=1.0)
         nn.init.zeros_(self.critic_head.bias)
 
-    def _get_critic_features(self, features, memory_override=None):
+    # ── Helpers ────────────────────────────────────────────────────────────
+
+    def _flatten_obs(self, obs: dict) -> torch.Tensor:
+        parts = [obs[k].float().flatten(start_dim=1) for k in self.obs_keys]
+        return torch.cat(parts, dim=-1)                  # (B, total_in)
+
+    def init_hidden(self, batch_size: int, device) -> tuple:
+        """Returns (h0, c0) of shape (1, B, lstm_hidden) on `device`."""
+        h = torch.zeros(1, batch_size, self.lstm_hidden, device=device)
+        c = torch.zeros(1, batch_size, self.lstm_hidden, device=device)
+        return h, c
+
+    # ── Single-step forward (rollout)  ─────────────────────────────────────
+
+    def step(self, obs: dict, hidden: tuple) -> tuple:
         """
-        Augments current features with a summary of recent memory.
-        Uses memory_override during PPO updates, self.extractor.memory during rollout.
+        One-step inference used during rollout collection.
+        obs: dict of (B, *shape) tensors
+        hidden: (h, c) each (1, B, lstm_hidden)
+        Returns: (lstm_out (B, lstm_hidden), new_hidden)
         """
-        # Use override if provided (PPO update), else fall back to rolling memory
-        memory = memory_override if memory_override is not None else self.extractor.memory
+        enc = self.encoder(self._flatten_obs(obs))      # (B, features_dim)
+        enc = enc.unsqueeze(1)                           # (B, 1, features_dim)
+        out, new_hidden = self.lstm(enc, hidden)         # out: (B, 1, lstm_hidden)
+        return out.squeeze(1), new_hidden                # (B, lstm_hidden), (h, c)
 
-        if memory is None:
-            return features
+    def get_value(self, obs: dict, hidden: tuple) -> tuple:
+        lstm_out, new_hidden = self.step(obs, hidden)
+        return self.critic_head(lstm_out), new_hidden
 
-        # Mean-pool last layer's memory: (B, memory_len, D) → (B, D)
-        mem_summary = memory[-1].mean(dim=1)
-
-        # Guard against batch size mismatch (safety check)
-        if mem_summary.shape[0] != features.shape[0]:
-            return features
-
-        combined = torch.cat([features, mem_summary], dim=-1)  # (B, 2D)
-        return self.critic_aggregator(combined)                 # (B, D)
-
-    def get_value(self, obs, memory_override=None):
-        features        = self.extractor(obs, memory_override=memory_override)
-        critic_features = self._get_critic_features(features, memory_override=memory_override)
-        return self.critic_head(critic_features)
-
-    def get_action_and_value(self, obs, action=None, memory_override=None):
-        features    = self.extractor(obs, memory_override=memory_override)
-        logits_list = [head(features) for head in self.actor_heads]
+    def get_action_and_value(self, obs: dict, hidden: tuple, action=None) -> tuple:
+        lstm_out, new_hidden = self.step(obs, hidden)
+        logits_list = [head(lstm_out) for head in self.actor_heads]
         dists       = [Categorical(logits=l) for l in logits_list]
 
         if action is None:
             action = torch.stack([d.sample() for d in dists], dim=1)
 
-        log_prob        = sum(d.log_prob(action[:, i]) for i, d in enumerate(dists))
-        entropy         = sum(d.entropy() for d in dists)
-        critic_features = self._get_critic_features(features, memory_override=memory_override)
-        value           = self.critic_head(critic_features)
-        return action, log_prob, entropy, value
+        log_prob = sum(d.log_prob(action[:, i]) for i, d in enumerate(dists))
+        entropy  = sum(d.entropy() for d in dists)
+        value    = self.critic_head(lstm_out)
+        return action, log_prob, entropy, value, new_hidden
+
+    # ── Sequence forward (PPO update) ──────────────────────────────────────
+
+    def evaluate_sequence(self, obs_seq: dict, hidden_0: tuple, actions_seq: torch.Tensor,
+                          dones_seq: torch.Tensor) -> tuple:
+        """
+        Process a full (T, B, *) sequence through the LSTM, masking the hidden
+        state at episode boundaries.
+
+        obs_seq:    dict of (T, B, *shape) tensors
+        hidden_0:   (h, c) each (1, B, lstm_hidden) — the snapshot from step 0
+        actions_seq: (T, B, n_action_dims)
+        dones_seq:  (T, B) float — 1.0 where episode ended
+
+        Returns: log_probs (T*B,), entropy (T*B,), values (T*B,)
+        """
+        T, B = dones_seq.shape
+        device = dones_seq.device
+
+        # Encode all obs at once: (T*B, features_dim) → reshape (T, B, features_dim)
+        flat_obs = {k: obs_seq[k].reshape(T * B, *obs_seq[k].shape[2:]) for k in self.obs_keys}
+        enc = self.encoder(self._flatten_obs(flat_obs)).reshape(T, B, -1)
+
+        # Step through LSTM one timestep at a time so we can mask at dones
+        h, c = hidden_0
+        lstm_outs = []
+        for t in range(T):
+            out, (h, c) = self.lstm(enc[t].unsqueeze(1), (h, c))   # out: (B, 1, H)
+            lstm_outs.append(out.squeeze(1))                         # (B, H)
+            # Reset hidden where episodes ended AT this step
+            mask     = (1.0 - dones_seq[t]).unsqueeze(0).unsqueeze(-1)  # (1, B, 1)
+            h        = h * mask
+            c        = c * mask
+
+        lstm_out = torch.stack(lstm_outs, dim=0)      # (T, B, H)
+        lstm_flat = lstm_out.reshape(T * B, -1)           # (T*B, H)
+        acts_flat = actions_seq.reshape(T * B, -1)        # (T*B, n_dims)
+
+        logits_list = [head(lstm_flat) for head in self.actor_heads]
+        dists       = [Categorical(logits=l) for l in logits_list]
+
+        log_prob = sum(d.log_prob(acts_flat[:, i]) for i, d in enumerate(dists))
+        entropy  = sum(d.entropy() for d in dists)
+        value    = self.critic_head(lstm_flat).squeeze(-1)
+        return log_prob, entropy, value
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Rollout buffer
+# Rollout buffer with LSTM hidden snapshots
 # ─────────────────────────────────────────────────────────────────────────────
 
-class TrXLRolloutBuffer:
+class RecurrentRolloutBuffer:
     """
-    Stores (n_steps, n_envs) transitions with per-env memory snapshots.
+    Stores (n_steps, n_envs) transitions plus per-env LSTM hidden-state snapshots.
 
-    Layout change from single-env:
-      obs_bufs:          (n_steps, n_envs, *obs_shape)
-      actions/rewards:   (n_steps, n_envs)
-      memory_snapshots:  (n_layers, n_steps, n_envs, memory_len, d_model)
-
-    get_minibatches() flattens the (n_steps * n_envs) dimension and
-    shuffles before yielding batches, exactly like CleanRL's reference PPO.
+    Minibatches are whole env-sequences (all n_steps steps for a subset of envs),
+    preserving temporal order so the LSTM can be replayed correctly.
     """
 
     def __init__(self, n_steps, n_envs, obs_space, action_nvec,
-                 n_layers, memory_len, d_model, device, gamma, gae_lambda):
+                 lstm_hidden, device, gamma, gae_lambda):
         self.n_steps    = n_steps
         self.n_envs     = n_envs
-        self.n_layers   = n_layers
-        self.memory_len = memory_len
-        self.d_model    = d_model
+        self.lstm_hidden = lstm_hidden
         self.device     = device
         self.gamma      = gamma
         self.gae_lambda = gae_lambda
+        self.obs_keys   = list(obs_space.spaces.keys())
 
-        self.obs_keys = list(obs_space.spaces.keys())
-
-        # (n_steps, n_envs, *shape)
         self.obs_bufs = {
             k: np.zeros((n_steps, n_envs, *obs_space.spaces[k].shape), dtype=np.float32)
             for k in self.obs_keys
         }
-        self.actions   = np.zeros((n_steps, n_envs, len(action_nvec)), dtype=np.int64)
-        self.rewards   = np.zeros((n_steps, n_envs), dtype=np.float32)
-        self.dones     = np.zeros((n_steps, n_envs), dtype=np.float32)
-        self.values    = np.zeros((n_steps, n_envs), dtype=np.float32)
-        self.log_probs = np.zeros((n_steps, n_envs), dtype=np.float32)
+        self.actions    = np.zeros((n_steps, n_envs, len(action_nvec)), dtype=np.int64)
+        self.rewards    = np.zeros((n_steps, n_envs), dtype=np.float32)
+        self.dones      = np.zeros((n_steps, n_envs), dtype=np.float32)
+        self.values     = np.zeros((n_steps, n_envs), dtype=np.float32)
+        self.log_probs  = np.zeros((n_steps, n_envs), dtype=np.float32)
         self.advantages = np.zeros((n_steps, n_envs), dtype=np.float32)
         self.returns    = np.zeros((n_steps, n_envs), dtype=np.float32)
 
-        # Memory snapshots stored on CPU
-        # Shape: (n_layers, n_steps, n_envs, memory_len, d_model)
-        self.memory_snapshots = [
-            torch.zeros(n_steps, n_envs, memory_len, d_model, dtype=torch.float32)
-            for _ in range(n_layers)
-        ]
+        # LSTM hidden snapshots: one per step, before the forward pass
+        # Shape: (n_steps, n_envs, lstm_hidden)  — stored for both h and c
+        self.hidden_h = torch.zeros(n_steps, n_envs, lstm_hidden)
+        self.hidden_c = torch.zeros(n_steps, n_envs, lstm_hidden)
 
-        self.ptr = 0
-
-    def add_step(self, step, obs_dict, actions, rewards, dones, values, log_probs, memory):
+    def add_step(self, step, obs_dict, actions, rewards, dones, values, log_probs,
+                 hidden_h, hidden_c):
         """
-        Store one step across all N envs simultaneously.
-
-        obs_dict:  dict of (n_envs, *shape) numpy arrays  — from SubprocVecEnv
-        actions:   (n_envs, n_action_dims) numpy array
-        rewards:   (n_envs,) numpy array
-        dones:     (n_envs,) numpy array
-        values:    (n_envs,) numpy array
-        log_probs: (n_envs,) numpy array
-        memory:    list of n_layers tensors, each (n_envs, memory_len, d_model)
-                   — the snapshot BEFORE this step's forward pass
+        hidden_h, hidden_c: (1, n_envs, lstm_hidden) tensors — snapshot BEFORE this step.
         """
         for k in self.obs_keys:
             self.obs_bufs[k][step] = obs_dict[k]
-
         self.actions[step]   = actions
         self.rewards[step]   = rewards
         self.dones[step]     = dones
         self.values[step]    = values
         self.log_probs[step] = log_probs
-
-        if memory is not None:
-            for layer_idx, layer_mem in enumerate(memory):
-                # layer_mem: (n_envs, memory_len, d_model)
-                self.memory_snapshots[layer_idx][step] = layer_mem.detach().cpu()
+        self.hidden_h[step]  = hidden_h.squeeze(0).detach().cpu()
+        self.hidden_c[step]  = hidden_c.squeeze(0).detach().cpu()
 
     def compute_gae(self, last_values, last_dones):
-        """
-        GAE over (n_steps, n_envs) grid.
-        last_values: (n_envs,) — value estimates for the state after the rollout
-        last_dones:  (n_envs,) — done flags at the rollout boundary
-        """
         last_gae = np.zeros(self.n_envs, dtype=np.float32)
-
         for t in reversed(range(self.n_steps)):
             if t == self.n_steps - 1:
                 next_non_terminal = 1.0 - last_dones.astype(np.float32)
@@ -295,60 +334,48 @@ class TrXLRolloutBuffer:
             else:
                 next_non_terminal = 1.0 - self.dones[t + 1]
                 next_values       = self.values[t + 1]
-
             delta              = self.rewards[t] + self.gamma * next_values * next_non_terminal - self.values[t]
             last_gae           = delta + self.gamma * self.gae_lambda * next_non_terminal * last_gae
             self.advantages[t] = last_gae
-
         self.returns = self.advantages + self.values
 
-    def get_minibatches(self, batch_size):
+    def get_env_sequence_batches(self, batch_envs: int):
         """
-        Flatten (n_steps, n_envs) → (n_steps * n_envs,) then shuffle and yield
-        minibatches. Each minibatch includes the memory snapshot from that
-        specific (step, env) pair — this is the per-env memory fix.
+        Yield batches of `batch_envs` complete env-sequences.
+        Each batch covers ALL n_steps steps for those envs.
+
+        Yields: (obs_seq, actions_seq, old_log_probs_seq, advantages_seq,
+                 returns_seq, old_values_seq, dones_seq, hidden_h_0, hidden_c_0)
+        All tensors have a leading (T=n_steps, B=batch_envs) shape,
+        except hidden_0 which is (1, B, lstm_hidden).
         """
-        total     = self.n_steps * self.n_envs
-        indices   = np.random.permutation(total)
+        env_order = np.random.permutation(self.n_envs)
 
-        # Pre-flatten everything for fast indexing
-        flat_obs = {
-            k: self.obs_bufs[k].reshape(total, *self.obs_bufs[k].shape[2:])
-            for k in self.obs_keys
-        }
-        flat_actions   = self.actions.reshape(total, -1)
-        flat_log_probs = self.log_probs.reshape(total)
-        flat_advantages = self.advantages.reshape(total)
-        flat_returns   = self.returns.reshape(total)
-        flat_values    = self.values.reshape(total)
+        for start in range(0, self.n_envs, batch_envs):
+            env_idx = env_order[start : start + batch_envs]
+            dev = self.device
 
-        # Memory: (n_layers, n_steps, n_envs, memory_len, d_model)
-        #       → (n_layers, n_steps*n_envs, memory_len, d_model)
-        flat_memory = [
-            self.memory_snapshots[l].reshape(total, self.memory_len, self.d_model)
-            for l in range(self.n_layers)
-        ]
-
-        for start in range(0, total, batch_size):
-            idx = indices[start : start + batch_size]
-
-            obs_batch = {
-                k: torch.tensor(flat_obs[k][idx], dtype=torch.float32).to(self.device)
+            obs_seq = {
+                k: torch.tensor(
+                    self.obs_bufs[k][:, env_idx],   # (T, B, *shape)
+                    dtype=torch.float32
+                ).to(dev)
                 for k in self.obs_keys
             }
-            memory_batch = [
-                flat_memory[l][idx].to(self.device)
-                for l in range(self.n_layers)
-            ]
+
+            # Initial hidden state = snapshot from step 0
+            h0 = self.hidden_h[0, env_idx].unsqueeze(0).to(dev)   # (1, B, H)
+            c0 = self.hidden_c[0, env_idx].unsqueeze(0).to(dev)
 
             yield (
-                obs_batch,
-                torch.tensor(flat_actions[idx],   dtype=torch.long).to(self.device),
-                torch.tensor(flat_log_probs[idx], dtype=torch.float32).to(self.device),
-                torch.tensor(flat_advantages[idx],dtype=torch.float32).to(self.device),
-                torch.tensor(flat_returns[idx],   dtype=torch.float32).to(self.device),
-                torch.tensor(flat_values[idx],    dtype=torch.float32).to(self.device),
-                memory_batch,
+                obs_seq,
+                torch.tensor(self.actions[:, env_idx],    dtype=torch.long).to(dev),       # (T, B, dims)
+                torch.tensor(self.log_probs[:, env_idx],  dtype=torch.float32).to(dev),    # (T, B)
+                torch.tensor(self.advantages[:, env_idx], dtype=torch.float32).to(dev),    # (T, B)
+                torch.tensor(self.returns[:, env_idx],    dtype=torch.float32).to(dev),    # (T, B)
+                torch.tensor(self.values[:, env_idx],     dtype=torch.float32).to(dev),    # (T, B)
+                torch.tensor(self.dones[:, env_idx],      dtype=torch.float32).to(dev),    # (T, B)
+                (h0, c0),
             )
 
 
@@ -357,22 +384,10 @@ class TrXLRolloutBuffer:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def vec_obs_to_tensor(obs_dict, device):
-    """
-    Convert SubprocVecEnv obs dict (n_envs, *shape) numpy → tensors on device.
-    No unsqueeze needed — batch dim is already the env dimension.
-    """
-    return {
-        k: torch.tensor(v, dtype=torch.float32).to(device)
-        for k, v in obs_dict.items()
-    }
-
+    return {k: torch.tensor(v, dtype=torch.float32).to(device) for k, v in obs_dict.items()}
 
 def single_obs_to_tensor(obs_dict, device):
-    """Convert single-env obs dict → tensor with batch dim for eval."""
-    return {
-        k: torch.tensor(v, dtype=torch.float32).unsqueeze(0).to(device)
-        for k, v in obs_dict.items()
-    }
+    return {k: torch.tensor(v, dtype=torch.float32).unsqueeze(0).to(device) for k, v in obs_dict.items()}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -380,77 +395,67 @@ def single_obs_to_tensor(obs_dict, device):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def make_env_fn(cfg: Config, rank: int):
-    """
-    Returns a thunk (zero-argument function) that creates one environment.
-    SubprocVecEnv calls these thunks in separate processes.
-
-    Only rank=0 renders and saves videos — all others run silently for speed.
-    """
     def _init():
         env = SingleAgentEnv(
             n_agents        = cfg.n_agents,
             world_size      = cfg.world_size,
             start_positions = [(cfg.world_size[0] // 2, cfg.world_size[1] // 2)],
-            render_mode     = "rgb_array" if rank == 0 else "rgb_array",
+            render_mode     = "rgb_array",
             sample_interval = 5      if rank == 0 else 999999,
             save_interval   = 5      if rank == 0 else 999999,
-            seed            = cfg.seed + rank if cfg.seed is not None else None,   # different seed per env
+            seed            = cfg.seed + rank if cfg.seed is not None else None,
             fixed_seed      = False,
             is_vid_out      = (rank == 0),
-            vid_id          = f"firescout_env{rank}",
-            vid_base_path   = "/home/s3400220/swarmfire/vids_parallel/",
+            vid_id          = f"firescout_rppo_env{rank}",
+            vid_base_path   = "/home/s3400220/swarmfire/vids_rppo/",
             phase_weights   = cfg.phase_weights,
-            device=torch.device("cuda:1")
+            device          = torch.device("cuda:1"),
         )
         return TimeLimit(env, max_episode_steps=cfg.iter_limit)
     return _init
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Evaluation (single env, same as before)
+# Evaluation
 # ─────────────────────────────────────────────────────────────────────────────
 
-def evaluate(agent, cfg, device, n_episodes=5):
+def evaluate(agent: LSTMActorCritic, cfg: Config, device, n_episodes=5):
     eval_env   = make_env_fn(cfg, rank=99)()
     ep_rewards = []
 
     for _ in range(n_episodes):
-        obs, _    = eval_env.reset()
-        done      = False
+        obs, _ = eval_env.reset()
+        done   = False
         ep_reward = 0.0
-        # Full reset including staging buffer
-        agent.extractor.memory           = None
-        agent.extractor._segment_hiddens = None
+        hidden = agent.init_hidden(batch_size=1, device=device)
 
         while not done:
             obs_t = single_obs_to_tensor(obs, device)
             with torch.no_grad():
-                action, _, _, _ = agent.get_action_and_value(obs_t)
+                action, _, _, _, hidden = agent.get_action_and_value(obs_t, hidden)
             obs, reward, terminated, truncated, _ = eval_env.step(
                 action.squeeze(0).cpu().numpy()
             )
-            done       = terminated or truncated
+            done = terminated or truncated
+            # Reset hidden on episode end
+            if done:
+                hidden = agent.init_hidden(batch_size=1, device=device)
             ep_reward += reward
-
         ep_rewards.append(ep_reward)
 
     eval_env.close()
-    agent.extractor.memory           = None
-    agent.extractor._segment_hiddens = None
     return float(np.mean(ep_rewards))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Main training loop
 # ─────────────────────────────────────────────────────────────────────────────
+
 def train(cfg: Config, checkpoint_path=None):
-
-    # ── Setup ─────────────────────────────────────────────────────────────────
     os.environ["WANDB_API_KEY"] = cfg.wandb_api_key
-    wandb.init(project=cfg.wandb_project, config=vars(cfg))
-
+    wandb.init(project=cfg.wandb_project, config=vars(cfg), name=None)
     cfg.run_id = wandb.run.name
-    print(f"[Train] : Begin training session with ID : {cfg.run_id}")
+    print(f"[Train] Recurrent PPO | run: {cfg.run_id}")
 
     os.makedirs(cfg.checkpoint_dir, exist_ok=True)
     os.makedirs(cfg.best_model_dir, exist_ok=True)
@@ -467,21 +472,18 @@ def train(cfg: Config, checkpoint_path=None):
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32       = True
 
-    # ── Vectorised environment ────────────────────────────────────────────────
-    envs = SubprocVecEnv([make_env_fn(cfg, rank=i) for i in range(cfg.n_envs)])
+    envs     = SubprocVecEnv([make_env_fn(cfg, rank=i) for i in range(cfg.n_envs)])
     obs_dict = envs.reset()
 
     obs_space   = envs.observation_space
     action_nvec = envs.action_space.nvec.tolist()
 
-    # ── Agent ─────────────────────────────────────────────────────────────────
-    agent     = TrXLActorCritic(obs_space, action_nvec, cfg).to(device)
+    agent     = LSTMActorCritic(obs_space, action_nvec, cfg).to(device)
     optimizer = optim.Adam(agent.parameters(), lr=cfg.learning_rate, eps=1e-5)
 
     global_step      = 0
     best_eval_reward = -np.inf
 
-    # ── Checkpoint loading ────────────────────────────────────────────────────
     if checkpoint_path is not None:
         print(f"[INIT] Loading checkpoint: {checkpoint_path}")
         ckpt             = torch.load(checkpoint_path, map_location=device)
@@ -493,73 +495,68 @@ def train(cfg: Config, checkpoint_path=None):
         recent_rewards   = deque(ckpt.get("recent_rewards", []), maxlen=100)
         next_ckpt_step   = global_step + cfg.checkpoint_freq
         next_eval_step   = global_step + cfg.eval_freq
+        # Restore hidden state tensors if present
+        saved_h = ckpt.get("hidden_h", None)
+        saved_c = ckpt.get("hidden_c", None)
+        if saved_h is not None:
+            hidden_h = saved_h.to(device)
+            hidden_c = saved_c.to(device)
+        else:
+            hidden_h, hidden_c = agent.init_hidden(cfg.n_envs, device)
         print(f"[INIT] Resumed from step {global_step}")
     else:
-        recent_rewards = deque(maxlen=100)
-        next_ckpt_step = cfg.checkpoint_freq
-        next_eval_step = cfg.eval_freq
+        recent_rewards   = deque(maxlen=100)
+        next_ckpt_step   = cfg.checkpoint_freq
+        next_eval_step   = cfg.eval_freq
         reward_rms_state = None
+        hidden_h, hidden_c = agent.init_hidden(cfg.n_envs, device)   # (1, n_envs, H)
 
-    # ── Reward normaliser ─────────────────────────────────────────────────────
     reward_rms = RunningMeanStd()
     if reward_rms_state is not None:
         reward_rms.mean  = reward_rms_state["mean"]
         reward_rms.var   = reward_rms_state["var"]
         reward_rms.count = reward_rms_state["count"]
 
-    # ── Rollout buffer ────────────────────────────────────────────────────────
-    buffer = TrXLRolloutBuffer(
+    buffer = RecurrentRolloutBuffer(
         n_steps     = cfg.n_steps,
         n_envs      = cfg.n_envs,
         obs_space   = obs_space,
         action_nvec = action_nvec,
-        n_layers    = cfg.n_layers,
-        memory_len  = cfg.memory_len,
-        d_model     = cfg.features_dim,
+        lstm_hidden = cfg.lstm_hidden,
         device      = device,
         gamma       = cfg.gamma,
         gae_lambda  = cfg.gae_lambda,
     )
 
-    #  Per-env episode trackers 
     ep_rewards = np.zeros(cfg.n_envs, dtype=np.float32)
     ep_lengths = np.zeros(cfg.n_envs, dtype=np.int32)
 
-    #  Scatter plot accumulators 
-    # 1. Episode length vs reward  (logged every 50 episodes)
-    scatter_ep_data:   list[list] = []   # [length, reward, env_idx]
-    # 2. Policy loss vs value loss  (logged every rollout)
-    scatter_loss_data: list[list] = []   # [policy_loss, value_loss]
-    # 3. KL divergence vs entropy   (logged every rollout)
-    scatter_kl_data:   list[list] = []   # [approx_kl, entropy]
-    scatter_ep_data:       list[list] = []
-    scatter_coverage_data: list[list] = []
-    scatter_loss_data:     list[list] = []
-    scatter_kl_data:       list[list] = []
+    scatter_ep_data:       list = []
+    scatter_coverage_data: list = []
+    scatter_loss_data:     list = []
+    scatter_kl_data:       list = []
     SCATTER_EP_FREQ = 50
     episode_count   = 0
 
-    agent.extractor.init_memory(batch_size=cfg.n_envs, device=device)
-
     print(f"[TRAIN] Starting - {cfg.total_timesteps:,} steps | "
-          f"rollout size = {cfg.n_steps * cfg.n_envs:,} transitions")
+          f"rollout = {cfg.n_steps * cfg.n_envs:,} transitions")
     start_time = time.time()
 
-    #  Main loop 
     while global_step < cfg.total_timesteps:
 
-        #  Rollout collection 
+        # ── Rollout ───────────────────────────────────────────────────────────
         agent.eval()
 
         for step in range(cfg.n_steps):
             obs_t = vec_obs_to_tensor(obs_dict, device)
 
             with torch.no_grad():
-                memory_snapshot = (
-                    [m.clone() for m in agent.extractor.memory]
-                    if agent.extractor.memory is not None else None
-                )
-                actions, log_probs, _, values = agent.get_action_and_value(obs_t)
+                # Snapshot hidden state BEFORE the forward pass
+                snap_h = hidden_h.clone()
+                snap_c = hidden_c.clone()
+
+                actions, log_probs, _, values, (hidden_h, hidden_c) = \
+                    agent.get_action_and_value(obs_t, (hidden_h, hidden_c))
 
             actions_np   = actions.cpu().numpy()
             values_np    = values.squeeze(-1).cpu().numpy()
@@ -578,7 +575,8 @@ def train(cfg: Config, checkpoint_path=None):
                 dones     = dones.astype(np.float32),
                 values    = values_np,
                 log_probs = log_probs_np,
-                memory    = memory_snapshot,
+                hidden_h  = snap_h,
+                hidden_c  = snap_c,
             )
 
             obs_dict     = next_obs_dict
@@ -586,14 +584,19 @@ def train(cfg: Config, checkpoint_path=None):
             ep_rewards  += rewards
             ep_lengths  += 1
 
+            # Reset hidden for envs that finished an episode
             done_envs = np.where(dones)[0]
+            if len(done_envs) > 0:
+                hidden_h[:, done_envs, :] = 0.0
+                hidden_c[:, done_envs, :] = 0.0
+
             for env_idx in done_envs:
                 recent_rewards.append(float(ep_rewards[env_idx]))
-                mean_reward  = np.mean(recent_rewards) if recent_rewards else 0.0
+                mean_reward    = np.mean(recent_rewards) if recent_rewards else 0.0
                 episode_count += 1
 
-                info           = infos[env_idx]
-                domain_metrics = info.get("domain_metrics", {})
+                info             = infos[env_idx]
+                domain_metrics   = info.get("domain_metrics", {})
                 filtered_domain_metrics = {
                     k: v for k, v in domain_metrics.items() if v != cfg.iter_limit
                 }
@@ -607,7 +610,6 @@ def train(cfg: Config, checkpoint_path=None):
                     **filtered_domain_metrics,
                 })
 
-                # Scatter 1: episode length vs reward 
                 scatter_ep_data.append([
                     int(ep_lengths[env_idx]),
                     float(ep_rewards[env_idx]),
@@ -620,17 +622,13 @@ def train(cfg: Config, checkpoint_path=None):
                                 columns=["episode_length", "reward", "env_idx"],
                                 data=scatter_ep_data,
                             ),
-                            x="episode_length",
-                            y="reward",
+                            x="episode_length", y="reward",
                             title="Episode Length vs Reward",
                         ),
                         "global_step": global_step,
                     })
-                    scatter_ep_data = []   # flush prevents the table growing unboundedly
-                
-                # Scatter 2: fire coverage progression (steps to reach each threshold) 
-                # Each episode contributes one curve: [threshold, steps_to_reach]
-                # -1 means the agent never reached that threshold skip those points
+                    scatter_ep_data = []
+
                 coverage_thresholds = [25, 50, 75, 90, 99]
                 for pct in coverage_thresholds:
                     ts = domain_metrics.get(f"domain/fire_coverage_{pct}", -1)
@@ -644,28 +642,26 @@ def train(cfg: Config, checkpoint_path=None):
                                 columns=["coverage_threshold_%", "steps_to_reach", "env_idx"],
                                 data=scatter_coverage_data,
                             ),
-                            x="coverage_threshold_%",
-                            y="steps_to_reach",
+                            x="coverage_threshold_%", y="steps_to_reach",
                             title="Steps to Reach Fire Coverage Thresholds",
                         ),
                         "global_step": global_step,
                     })
                     scatter_coverage_data = []
 
-                agent.extractor.reset_memory([env_idx])
                 ep_rewards[env_idx] = 0.0
                 ep_lengths[env_idx] = 0
 
-        # Compute GAE 
+        # ── GAE ───────────────────────────────────────────────────────────────
         with torch.no_grad():
             obs_t       = vec_obs_to_tensor(obs_dict, device)
-            last_values = agent.get_value(obs_t).squeeze(-1).cpu().numpy()
+            last_values, _ = agent.get_value(obs_t, (hidden_h, hidden_c))
+            last_values = last_values.squeeze(-1).cpu().numpy()
 
         buffer.compute_gae(last_values=last_values, last_dones=dones)
 
-        # PPO update
+        # ── PPO update ────────────────────────────────────────────────────────
         agent.train()
-
         policy_losses, value_losses, entropies, kl_divs = [], [], [], []
         stop_early = False
 
@@ -673,28 +669,35 @@ def train(cfg: Config, checkpoint_path=None):
             if stop_early:
                 break
 
-            for (obs_b, actions_b, old_log_probs_b,
-                 advantages_b, returns_b, old_values_b,
-                 memory_b) in buffer.get_minibatches(cfg.batch_size):
+            for (obs_seq, actions_seq, old_log_probs_seq,
+                 advantages_seq, returns_seq, old_values_seq,
+                 dones_seq, (h0, c0)) in buffer.get_env_sequence_batches(cfg.batch_envs):
 
-                advantages_b = (advantages_b - advantages_b.mean()) / (advantages_b.std() + 1e-8)
+                T, B = dones_seq.shape
 
-                _, new_log_probs, entropy, new_values = agent.get_action_and_value(
-                    obs_b, action=actions_b, memory_override=memory_b,
+                # Normalise advantages over this batch
+                adv_flat = advantages_seq.reshape(-1)
+                adv_flat = (adv_flat - adv_flat.mean()) / (adv_flat.std() + 1e-8)
+
+                new_log_probs, entropy, new_values = agent.evaluate_sequence(
+                    obs_seq, (h0, c0), actions_seq, dones_seq
                 )
-                new_values = new_values.squeeze(-1)
 
-                log_ratio  = new_log_probs - old_log_probs_b
+                old_log_probs_flat = old_log_probs_seq.reshape(-1)
+                old_values_flat    = old_values_seq.reshape(-1)
+                returns_flat       = returns_seq.reshape(-1)
+
+                log_ratio  = new_log_probs - old_log_probs_flat
                 ratio      = log_ratio.exp()
                 approx_kl  = ((ratio - 1) - log_ratio).mean().item()
 
-                pg_loss1    = -advantages_b * ratio
-                pg_loss2    = -advantages_b * torch.clamp(ratio, 1 - cfg.clip_coef, 1 + cfg.clip_coef)
+                pg_loss1    = -adv_flat * ratio
+                pg_loss2    = -adv_flat * torch.clamp(ratio, 1 - cfg.clip_coef, 1 + cfg.clip_coef)
                 policy_loss = torch.max(pg_loss1, pg_loss2).mean()
 
-                v_clipped  = old_values_b + torch.clamp(new_values - old_values_b, -cfg.clip_coef, cfg.clip_coef)
-                vf_loss1   = (new_values - returns_b).pow(2)
-                vf_loss2   = (v_clipped  - returns_b).pow(2)
+                v_clipped  = old_values_flat + torch.clamp(new_values - old_values_flat, -cfg.clip_coef, cfg.clip_coef)
+                vf_loss1   = (new_values - returns_flat).pow(2)
+                vf_loss2   = (v_clipped  - returns_flat).pow(2)
                 value_loss = 0.5 * torch.max(vf_loss1, vf_loss2).mean()
 
                 entropy_loss = entropy.mean()
@@ -705,8 +708,8 @@ def train(cfg: Config, checkpoint_path=None):
                 nn.utils.clip_grad_norm_(agent.parameters(), cfg.max_grad_norm)
                 optimizer.step()
 
-                pl = policy_loss.item()
-                vl = value_loss.item()
+                pl  = policy_loss.item()
+                vl  = value_loss.item()
                 ent = entropy_loss.item()
 
                 policy_losses.append(pl)
@@ -714,20 +717,18 @@ def train(cfg: Config, checkpoint_path=None):
                 entropies.append(ent)
                 kl_divs.append(approx_kl)
 
-                # Scatter accumulators (per minibatch) 
                 scatter_loss_data.append([pl, vl])
                 scatter_kl_data.append([approx_kl, ent])
 
             if kl_divs and np.mean(kl_divs) > cfg.target_kl:
-                print(f"[PPO] Early stop at epoch {epoch+1}, KL={np.mean(kl_divs):.4f}")
+                print(f"[RPPO] Early stop at epoch {epoch+1}, KL={np.mean(kl_divs):.4f}")
                 stop_early = True
 
-        # Detach memory 
-        agent.extractor.memory = [m.detach() for m in agent.extractor.memory]
-        if agent.extractor._segment_hiddens is not None:
-            agent.extractor._segment_hiddens = [h.detach() for h in agent.extractor._segment_hiddens]
+        # Detach hidden after update
+        hidden_h = hidden_h.detach()
+        hidden_c = hidden_c.detach()
 
-        # Logging (per rollout) 
+        # ── Rollout logging ───────────────────────────────────────────────────
         elapsed = time.time() - start_time
         sps     = global_step / elapsed if elapsed > 0 else 0
 
@@ -736,8 +737,6 @@ def train(cfg: Config, checkpoint_path=None):
         mean_ent = np.mean(entropies)     if entropies      else 0.0
         mean_kl  = np.mean(kl_divs)       if kl_divs        else 0.0
 
-        # ── Scatter 2: policy loss vs value loss ──────────────────────────────
-        # ── Scatter 3: KL divergence vs entropy ──────────────────────────────
         wandb.log({
             "train/policy_loss":   mean_pl,
             "train/value_loss":    mean_vl,
@@ -746,19 +745,15 @@ def train(cfg: Config, checkpoint_path=None):
             "train/steps_per_sec": sps,
             "scatter/policy_loss_vs_value_loss": wandb.plot.scatter(
                 wandb.Table(columns=["policy_loss", "value_loss"], data=scatter_loss_data),
-                x="policy_loss",
-                y="value_loss",
-                title="Policy Loss vs Value Loss",
+                x="policy_loss", y="value_loss", title="Policy Loss vs Value Loss",
             ),
             "scatter/kl_vs_entropy": wandb.plot.scatter(
                 wandb.Table(columns=["approx_kl", "entropy"], data=scatter_kl_data),
-                x="approx_kl",
-                y="entropy",
-                title="KL Divergence vs Entropy",
+                x="approx_kl", y="entropy", title="KL Divergence vs Entropy",
             ),
             "global_step": global_step,
         })
-        scatter_loss_data = []   # flush each rollout
+        scatter_loss_data = []
         scatter_kl_data   = []
 
         print(
@@ -770,20 +765,22 @@ def train(cfg: Config, checkpoint_path=None):
 
         # ── Checkpoint ────────────────────────────────────────────────────────
         if global_step >= next_ckpt_step:
-            ckpt_path = os.path.join(cfg.checkpoint_dir, f"firescout_{global_step}_steps.pt")
+            ckpt_path = os.path.join(cfg.checkpoint_dir, f"firescout_rppo_{global_step}_steps.pt")
             torch.save({
                 "agent":            agent.state_dict(),
                 "optimizer":        optimizer.state_dict(),
                 "global_step":      global_step,
                 "best_eval_reward": best_eval_reward,
                 "recent_rewards":   list(recent_rewards),
+                "hidden_h":         hidden_h.cpu(),
+                "hidden_c":         hidden_c.cpu(),
                 "reward_rms": {
                     "mean":  reward_rms.mean,
                     "var":   reward_rms.var,
                     "count": reward_rms.count,
                 },
             }, ckpt_path)
-            print(f"[CKPT] Saved : {ckpt_path}")
+            print(f"[CKPT] Saved: {ckpt_path}")
             next_ckpt_step += cfg.checkpoint_freq
 
         # ── Evaluation ────────────────────────────────────────────────────────
@@ -800,18 +797,17 @@ def train(cfg: Config, checkpoint_path=None):
                     "global_step":      global_step,
                     "best_eval_reward": best_eval_reward,
                 }, os.path.join(cfg.best_model_dir, "best_model.pt"))
-                print(f"[EVAL] New best : {best_eval_reward:.3f}")
+                print(f"[EVAL] New best: {best_eval_reward:.3f}")
 
-            agent.extractor.init_memory(batch_size=cfg.n_envs, device=device)
             next_eval_step += cfg.eval_freq
 
-    # ── End ───────────────────────────────────────────────────────────────────
+    # ── Final save ────────────────────────────────────────────────────────────
     torch.save({
         "agent":            agent.state_dict(),
         "optimizer":        optimizer.state_dict(),
         "global_step":      global_step,
         "best_eval_reward": best_eval_reward,
-    }, "./firescout_final.pt")
+    }, "./firescout_rppo_final.pt")
     print("[DONE] Training complete.")
     wandb.finish()
     envs.close()
@@ -822,9 +818,7 @@ def train(cfg: Config, checkpoint_path=None):
 # ─────────────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="CleanRL TrXL PPO - FireScout (parallel)")
+    parser = argparse.ArgumentParser(description="CleanRL Recurrent PPO - FireScout (parallel)")
     parser.add_argument("-c", "--checkpoint", type=str, default=None)
     args = parser.parse_args()
-
-    cfg = Config()
-    train(cfg, checkpoint_path=args.checkpoint)
+    train(Config(), checkpoint_path=args.checkpoint)

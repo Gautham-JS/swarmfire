@@ -16,7 +16,7 @@ from agents import Drone
 
 import wandb
 
-class SingleAgentEnv(gym.Env):
+class IsolatedAgentEnv(gym.Env):
 
     metadata = {"render_modes": ["human", "rgb_array"], "render_fps": 30, "name": "multi_drone_v0"}
 
@@ -80,7 +80,7 @@ class SingleAgentEnv(gym.Env):
 
         # n_agents * (x, y, vx, vy, fire_dx, fire_dy, fire_dist) = n_agents * 7
         self.observation_space = gym.spaces.Dict({
-            "viewport": gym.spaces.Box(low=0.0, high=1.0, shape=(3, 84, 84), dtype=np.float32),
+            "viewport": gym.spaces.Box(low=0.0, high=1.0, shape=(2, 84, 84), dtype=np.float32),
             "positions": gym.spaces.Box(low=-1.0, high=1.0, shape=(self.n_agents * 4,), dtype=np.float32)
         })
 
@@ -243,7 +243,7 @@ class SingleAgentEnv(gym.Env):
         self._pos_history = [list(self._agent_positions)]
 
         obs = {
-            "viewport":  np.zeros((3, 84, 84), dtype=np.float32),
+            "viewport":  np.zeros((2, 84, 84), dtype=np.float32),
             "positions": self._build_positions_obs(),
         }
         
@@ -782,7 +782,7 @@ class SingleAgentEnv(gym.Env):
         recency_crop = Viewpoint.get_square_viewpoint(self.recency_map, (cx, cy), self.vp_size)                                  # (H', W')
         recency_resized = cv2.resize(recency_crop, (84, 84), interpolation=cv2.INTER_AREA)[None]  # (1, 84, 84)
 
-        return np.concatenate([scene_chw, recency_resized], axis=0).astype(np.float32)  # (3, 84, 84)
+        return scene_chw.astype(np.float32)  # (2, 84, 84)
 
     def _build_positions_obs(self) -> np.ndarray:
         obs = []
