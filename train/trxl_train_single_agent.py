@@ -28,70 +28,24 @@ import wandb
 from gymnasium.wrappers import TimeLimit
 from stable_baselines3.common.vec_env import SubprocVecEnv
 from envs.WindSingleAgentEnv import SingleAgentEnv
-from envs.IsolatedAgent import IsolatedAgentEnv
+# from envs.IsolatedAgent import IsolatedAgentEnv // INOP for refactors
+from envs.WildfireSingleAgentEnv import WildfireSingleAgentEnv
+from config.Config import VideoWriterConfig, EnvConfig
 from policies.TrXL import TrXLExtractor
+
+import logging
+
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+)
+
 
 
 # 
 # Config
 # 
-
-@dataclass
-class Config:
-    run_id:           str   = None
-
-    # Environment
-    world_size:       tuple = (512, 512)
-    n_agents:         int   = 1
-    iter_limit:       int   = 512
-    seed:             int   = None
-    n_envs:           int   = 8          # parallel environments
-
-    # TrXL
-    features_dim:     int   = 256
-    memory_len:       int   = 128
-    n_layers:         int   = 4
-    n_heads:          int   = 4
-    d_ff_multiplier:  int   = 2
-    dropout:          float = 0.1
-
-    # PPO
-    total_timesteps:  int   = 2_000_000
-    n_steps:          int   = 512        # steps per env per rollout
-                                         # total transitions = n_steps * n_envs. 
-    batch_size:       int   = 256        # minibatch size for PPO update
-    n_epochs:         int   = 10
-    learning_rate:    float = 1e-4
-    gamma:            float = 0.99
-    gae_lambda:       float = 0.95
-    clip_coef:        float = 0.2
-    ent_coef:         float = 0.0001
-    vf_coef:          float = 0.5
-    max_grad_norm:    float = 0.3
-    target_kl:        float = 0.03
-
-    # Env weights
-    phase_weights:    dict  = field(default_factory=lambda: {
-        "exploration":          1.0,
-        "exploration_tracking": 0.05,
-        "fire_discovery":       18.8,
-        "fire_tracking":        10.5,
-        "risk":                 1.5,
-    })
-
-    # Checkpointing
-    checkpoint_freq:  int   = 50_000
-    checkpoint_dir:   str   = "./checkpoints"
-    best_model_dir:   str   = "./best_model"
-
-    # Evaluation
-    eval_freq:        int   = 50_000
-    n_eval_episodes:  int   = 5
-
-    # WandB
-    wandb_project:    str   = "thesis-drl-trxl"
-    wandb_api_key:    str   = "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"
-
 
 
 
@@ -131,7 +85,7 @@ class RunningMeanStd:
 # 
 
 class TrXLActorCritic(nn.Module):
-    def __init__(self, observation_space, action_nvec, cfg: Config):
+    def __init__(self, observation_space, action_nvec, cfg: EnvConfig):
         super().__init__()
 
         self.extractor = TrXLExtractor(
@@ -380,28 +334,36 @@ def single_obs_to_tensor(obs_dict, device):
 # Environment factory
 # 
 
-def make_env_fn(cfg: Config, rank: int):
+def make_env_fn(cfg: EnvConfig, rank: int):
     """
     Returns a thunk (zero-argument function) that creates one environment.
     SubprocVecEnv calls these thunks in separate processes.
 
     Only rank=0 renders and saves videos — all others run silently for speed.
     """
+    video_config = VideoWriterConfig(
+        is_enabled      = rank == 0,
+        sample_interval = 10      if rank == 0 else 999999,
+        save_interval   = 10      if rank == 0 else 999999,
+        base_path       = "./vids_isolated/"
+    )
+
+    phase_weights: dict  ={
+        "exploration":          1.0,
+        "exploration_tracking": 0.05,
+        "fire_discovery":       28.8,
+        "fire_tracking":        10.5,
+        "risk":                 1.5,
+    }
+
     def _init():
-        env = SingleAgentEnv(
-            n_agents        = cfg.n_agents,
+        env = WildfireSingleAgentEnv(
             world_size      = cfg.world_size,
-            start_positions = [(cfg.world_size[0] // 2, cfg.world_size[1] // 2)],
             render_mode     = "rgb_array" if rank == 0 else "rgb_array",
-            sample_interval = 5      if rank == 0 else 999999,
-            save_interval   = 5      if rank == 0 else 999999,
             seed            = cfg.seed + rank if cfg.seed is not None else None,   # different seed per env
-            fixed_seed      = False,
-            is_vid_out      = (rank == 0),
-            vid_id          = f"firescout_env{rank}",
-            vid_base_path   = "/home/s3400220/swarmfire/vids_parallel/",
-            phase_weights   = cfg.phase_weights,
-            device=torch.device("cuda:1")
+            video_config    = video_config,
+            phase_weights   = phase_weights,
+            device          = torch.device("cuda:1")
         )
         return TimeLimit(env, max_episode_steps=cfg.iter_limit)
     return _init
@@ -444,14 +406,14 @@ def evaluate(agent, cfg, device, n_episodes=5):
 # 
 # Main training loop
 # 
-def train(cfg: Config, checkpoint_path=None):
+def train(cfg: EnvConfig, checkpoint_path=None):
 
     # ── Setup ─────────────────────────────────────────────────────────────────
     os.environ["WANDB_API_KEY"] = cfg.wandb_api_key
     wandb.init(project=cfg.wandb_project, config=vars(cfg))
 
     cfg.run_id = wandb.run.name
-    print(f"[Train] : Begin training session with ID : {cfg.run_id}")
+    logging.info(f"[Train] : Begin training session with ID : {cfg.run_id}")
 
     os.makedirs(cfg.checkpoint_dir, exist_ok=True)
     os.makedirs(cfg.best_model_dir, exist_ok=True)
@@ -462,7 +424,7 @@ def train(cfg: Config, checkpoint_path=None):
         torch.manual_seed(cfg.seed)
 
     device = torch.device("cuda:1" if torch.cuda.is_available() else "cpu")
-    print(f"[INIT] Device: {device} | N envs: {cfg.n_envs}")
+    logging.info(f"[INIT] Device: {device} | N envs: {cfg.n_envs}")
 
     torch.backends.cudnn.benchmark        = True
     torch.backends.cuda.matmul.allow_tf32 = True
@@ -484,7 +446,7 @@ def train(cfg: Config, checkpoint_path=None):
 
     # ── Checkpoint loading ────────────────────────────────────────────────────
     if checkpoint_path is not None:
-        print(f"[INIT] Loading checkpoint: {checkpoint_path}")
+        logging.info(f"[INIT] Loading checkpoint: {checkpoint_path}")
         ckpt             = torch.load(checkpoint_path, map_location=device)
         agent.load_state_dict(ckpt["agent"])
         optimizer.load_state_dict(ckpt["optimizer"])
@@ -494,7 +456,7 @@ def train(cfg: Config, checkpoint_path=None):
         recent_rewards   = deque(ckpt.get("recent_rewards", []), maxlen=100)
         next_ckpt_step   = global_step + cfg.checkpoint_freq
         next_eval_step   = global_step + cfg.eval_freq
-        print(f"[INIT] Resumed from step {global_step}")
+        logging.info(f"[INIT] Resumed from step {global_step}")
     else:
         recent_rewards = deque(maxlen=100)
         next_ckpt_step = cfg.checkpoint_freq
@@ -542,7 +504,7 @@ def train(cfg: Config, checkpoint_path=None):
 
     agent.extractor.init_memory(batch_size=cfg.n_envs, device=device)
 
-    print(f"[TRAIN] Starting - {cfg.total_timesteps:,} steps | "
+    logging.info(f"[TRAIN] Starting - {cfg.total_timesteps:,} steps | "
           f"rollout size = {cfg.n_steps * cfg.n_envs:,} transitions")
     start_time = time.time()
 
@@ -605,7 +567,7 @@ def train(cfg: Config, checkpoint_path=None):
                     "episode/mean_reward": mean_reward,
                     "episode/env_idx":     env_idx,
                     "global_step":         global_step,
-                    **filtered_domain_metrics,
+                    # **filtered_domain_metrics,
                 })
 
                 # Scatter 1: episode length vs reward 
@@ -720,7 +682,7 @@ def train(cfg: Config, checkpoint_path=None):
                 scatter_kl_data.append([approx_kl, ent])
 
             if kl_divs and np.mean(kl_divs) > cfg.target_kl:
-                print(f"[PPO] Early stop at epoch {epoch+1}, KL={np.mean(kl_divs):.4f}")
+                logging.info(f"[PPO] Early stop at epoch {epoch+1}, KL={np.mean(kl_divs):.4f}")
                 stop_early = True
 
         # Detach memory 
@@ -762,7 +724,7 @@ def train(cfg: Config, checkpoint_path=None):
         scatter_loss_data = []   # flush each rollout
         scatter_kl_data   = []
 
-        print(
+        logging.info(
             f"[{global_step:>8}] "
             f"pl={mean_pl:.4f} vl={mean_vl:.4f} "
             f"ent={mean_ent:.4f} kl={mean_kl:.4f} "
@@ -784,13 +746,13 @@ def train(cfg: Config, checkpoint_path=None):
                     "count": reward_rms.count,
                 },
             }, ckpt_path)
-            print(f"[CKPT] Saved : {ckpt_path}")
+            logging.info(f"[CKPT] Saved : {ckpt_path}")
             next_ckpt_step += cfg.checkpoint_freq
 
         # ── Evaluation ────────────────────────────────────────────────────────
         if global_step >= next_eval_step:
             eval_reward = evaluate(agent, cfg, device, cfg.n_eval_episodes)
-            print(f"[EVAL] step={global_step} mean_reward={eval_reward:.3f}")
+            logging.info(f"[EVAL] step={global_step} mean_reward={eval_reward:.3f}")
             wandb.log({"eval/mean_reward": eval_reward, "global_step": global_step})
 
             if eval_reward > best_eval_reward:
@@ -801,7 +763,7 @@ def train(cfg: Config, checkpoint_path=None):
                     "global_step":      global_step,
                     "best_eval_reward": best_eval_reward,
                 }, os.path.join(cfg.best_model_dir, "best_model.pt"))
-                print(f"[EVAL] New best : {best_eval_reward:.3f}")
+                logging.info(f"[EVAL] New best : {best_eval_reward:.3f}")
 
             agent.extractor.init_memory(batch_size=cfg.n_envs, device=device)
             next_eval_step += cfg.eval_freq
@@ -813,19 +775,7 @@ def train(cfg: Config, checkpoint_path=None):
         "global_step":      global_step,
         "best_eval_reward": best_eval_reward,
     }, "./firescout_final.pt")
-    print("[DONE] Training complete.")
+    logging.info("[DONE] Training complete.")
     wandb.finish()
     envs.close()
 
-
-# 
-# Entry point
-# 
-
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="CleanRL TrXL PPO - FireScout (parallel)")
-    parser.add_argument("-c", "--checkpoint", type=str, default=None)
-    args = parser.parse_args()
-
-    cfg = Config()
-    train(cfg, checkpoint_path=args.checkpoint)

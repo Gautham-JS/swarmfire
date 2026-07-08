@@ -2,13 +2,13 @@
 CleanRL-style Recurrent PPO (LSTM hidden-state memory) — parallel environments.
 
 Recurrent PPO baseline for the TrXL version:
-  • Same environment, same SubprocVecEnv setup.
-  • Same WandB logging (all episode/train/eval/scatter metrics).
-  • Same reward normalisation, checkpointing, evaluation.
-  • Memory model: single-layer LSTM whose hidden state (h, c) is carried
+  * Same environment, same SubprocVecEnv setup.
+  * Same WandB logging (all episode/train/eval/scatter metrics).
+  * Same reward normalisation, checkpointing, evaluation.
+  * Memory model: single-layer LSTM whose hidden state (h, c) is carried
     between steps, reset on episode done — exactly mirroring the TrXL
     memory reset logic.
-  • GAE is computed per-sequence (the full rollout per env), NOT shuffled
+  * GAE is computed per-sequence (the full rollout per env), NOT shuffled
     across envs — this is the standard recurrent PPO approach.  Minibatches
     are whole env-sequences of length n_steps, keeping temporal order intact.
 
@@ -43,9 +43,9 @@ from envs.SingleAgentEnv import SingleAgentEnv
 from envs.IsolatedAgent import IsolatedAgentEnv
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# 
 # Config
-# ─────────────────────────────────────────────────────────────────────────────
+# 
 
 @dataclass
 class Config:
@@ -66,7 +66,7 @@ class Config:
     # PPO (mirrors TrXL config)
     total_timesteps:  int   = 2_000_000
     n_steps:          int   = 512        # steps per env per rollout
-    batch_envs:       int   = 2          # env-sequences per minibatch (≈ batch_size / n_steps)
+    batch_envs:       int   = 2          # env-sequences per minibatch (approx batch_size / n_steps)
     n_epochs:         int   = 10
     learning_rate:    float = 1e-4
     gamma:            float = 0.99
@@ -100,9 +100,9 @@ class Config:
     wandb_api_key:    str   = "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"
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# 
 # Running reward normaliser
-# ─────────────────────────────────────────────────────────────────────────────
+# 
 
 class RunningMeanStd:
     def __init__(self, epsilon=1e-4):
@@ -129,14 +129,14 @@ class RunningMeanStd:
         return np.clip(normed, -clip, clip).astype(np.float32)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Recurrent Actor-Critic  (MLP encoder → LSTM → actor/critic heads)
-# ─────────────────────────────────────────────────────────────────────────────
+# 
+# Recurrent Actor-Critic  (MLP encoder -> LSTM -> actor/critic heads)
+# 
 
 class LSTMActorCritic(nn.Module):
     """
     Architecture:
-      obs dict  →  flatten  →  MLP encoder  →  LSTM  →  actor / critic heads
+      obs dict  ->  flatten  ->  MLP encoder  ->  LSTM  ->  actor / critic heads
 
     The LSTM hidden state (h, c) is maintained externally by the training loop
     so that it can be snapshotted and replayed during the PPO update.
@@ -182,7 +182,7 @@ class LSTMActorCritic(nn.Module):
         nn.init.orthogonal_(self.critic_head.weight, gain=1.0)
         nn.init.zeros_(self.critic_head.bias)
 
-    # ── Helpers ────────────────────────────────────────────────────────────
+    #  Helpers 
 
     def _flatten_obs(self, obs: dict) -> torch.Tensor:
         parts = [obs[k].float().flatten(start_dim=1) for k in self.obs_keys]
@@ -194,7 +194,7 @@ class LSTMActorCritic(nn.Module):
         c = torch.zeros(1, batch_size, self.lstm_hidden, device=device)
         return h, c
 
-    # ── Single-step forward (rollout)  ─────────────────────────────────────
+    #  Single-step forward (rollout)  
 
     def step(self, obs: dict, hidden: tuple) -> tuple:
         """
@@ -225,7 +225,7 @@ class LSTMActorCritic(nn.Module):
         value    = self.critic_head(lstm_out)
         return action, log_prob, entropy, value, new_hidden
 
-    # ── Sequence forward (PPO update) ──────────────────────────────────────
+    #  Sequence forward (PPO update) 
 
     def evaluate_sequence(self, obs_seq: dict, hidden_0: tuple, actions_seq: torch.Tensor,
                           dones_seq: torch.Tensor) -> tuple:
@@ -243,7 +243,7 @@ class LSTMActorCritic(nn.Module):
         T, B = dones_seq.shape
         device = dones_seq.device
 
-        # Encode all obs at once: (T*B, features_dim) → reshape (T, B, features_dim)
+        # Encode all obs at once: (T*B, features_dim) -> reshape (T, B, features_dim)
         flat_obs = {k: obs_seq[k].reshape(T * B, *obs_seq[k].shape[2:]) for k in self.obs_keys}
         enc = self.encoder(self._flatten_obs(flat_obs)).reshape(T, B, -1)
 
@@ -271,9 +271,9 @@ class LSTMActorCritic(nn.Module):
         return log_prob, entropy, value
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# 
 # Rollout buffer with LSTM hidden snapshots
-# ─────────────────────────────────────────────────────────────────────────────
+# 
 
 class RecurrentRolloutBuffer:
     """
@@ -379,9 +379,9 @@ class RecurrentRolloutBuffer:
             )
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# 
 # Observation helpers
-# ─────────────────────────────────────────────────────────────────────────────
+# 
 
 def vec_obs_to_tensor(obs_dict, device):
     return {k: torch.tensor(v, dtype=torch.float32).to(device) for k, v in obs_dict.items()}
@@ -390,9 +390,9 @@ def single_obs_to_tensor(obs_dict, device):
     return {k: torch.tensor(v, dtype=torch.float32).unsqueeze(0).to(device) for k, v in obs_dict.items()}
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# 
 # Environment factory
-# ─────────────────────────────────────────────────────────────────────────────
+# 
 
 def make_env_fn(cfg: Config, rank: int):
     def _init():
@@ -415,9 +415,9 @@ def make_env_fn(cfg: Config, rank: int):
     return _init
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# 
 # Evaluation
-# ─────────────────────────────────────────────────────────────────────────────
+# 
 
 def evaluate(agent: LSTMActorCritic, cfg: Config, device, n_episodes=5):
     eval_env   = make_env_fn(cfg, rank=99)()
@@ -447,9 +447,9 @@ def evaluate(agent: LSTMActorCritic, cfg: Config, device, n_episodes=5):
     return float(np.mean(ep_rewards))
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# 
 # Main training loop
-# ─────────────────────────────────────────────────────────────────────────────
+# 
 
 def train(cfg: Config, checkpoint_path=None):
     os.environ["WANDB_API_KEY"] = cfg.wandb_api_key
@@ -544,7 +544,7 @@ def train(cfg: Config, checkpoint_path=None):
 
     while global_step < cfg.total_timesteps:
 
-        # ── Rollout ───────────────────────────────────────────────────────────
+        #  Rollout ───────────────────────────────────────────────────────────
         agent.eval()
 
         for step in range(cfg.n_steps):
@@ -652,7 +652,7 @@ def train(cfg: Config, checkpoint_path=None):
                 ep_rewards[env_idx] = 0.0
                 ep_lengths[env_idx] = 0
 
-        # ── GAE ───────────────────────────────────────────────────────────────
+        #  GAE ───────────────────────────────────────────────────────────────
         with torch.no_grad():
             obs_t       = vec_obs_to_tensor(obs_dict, device)
             last_values, _ = agent.get_value(obs_t, (hidden_h, hidden_c))
@@ -660,7 +660,7 @@ def train(cfg: Config, checkpoint_path=None):
 
         buffer.compute_gae(last_values=last_values, last_dones=dones)
 
-        # ── PPO update ────────────────────────────────────────────────────────
+        #  PPO update ────────────────────────────────────────────────────────
         agent.train()
         policy_losses, value_losses, entropies, kl_divs = [], [], [], []
         stop_early = False
@@ -728,7 +728,7 @@ def train(cfg: Config, checkpoint_path=None):
         hidden_h = hidden_h.detach()
         hidden_c = hidden_c.detach()
 
-        # ── Rollout logging ───────────────────────────────────────────────────
+        #  Rollout logging ───────────────────────────────────────────────────
         elapsed = time.time() - start_time
         sps     = global_step / elapsed if elapsed > 0 else 0
 
@@ -763,7 +763,7 @@ def train(cfg: Config, checkpoint_path=None):
             f"sps={sps:.0f}"
         )
 
-        # ── Checkpoint ────────────────────────────────────────────────────────
+        #  Checkpoint ────────────────────────────────────────────────────────
         if global_step >= next_ckpt_step:
             ckpt_path = os.path.join(cfg.checkpoint_dir, f"firescout_rppo_{global_step}_steps.pt")
             torch.save({
@@ -783,7 +783,7 @@ def train(cfg: Config, checkpoint_path=None):
             print(f"[CKPT] Saved: {ckpt_path}")
             next_ckpt_step += cfg.checkpoint_freq
 
-        # ── Evaluation ────────────────────────────────────────────────────────
+        #  Evaluation ────────────────────────────────────────────────────────
         if global_step >= next_eval_step:
             eval_reward = evaluate(agent, cfg, device, cfg.n_eval_episodes)
             print(f"[EVAL] step={global_step} mean_reward={eval_reward:.3f}")
@@ -801,7 +801,7 @@ def train(cfg: Config, checkpoint_path=None):
 
             next_eval_step += cfg.eval_freq
 
-    # ── Final save ────────────────────────────────────────────────────────────
+    #  Final save 
     torch.save({
         "agent":            agent.state_dict(),
         "optimizer":        optimizer.state_dict(),
@@ -813,9 +813,9 @@ def train(cfg: Config, checkpoint_path=None):
     envs.close()
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# 
 # Entry point
-# ─────────────────────────────────────────────────────────────────────────────
+# 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="CleanRL Recurrent PPO - FireScout (parallel)")

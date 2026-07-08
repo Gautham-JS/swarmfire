@@ -15,6 +15,26 @@ from utils import Generators, Viewpoint, GenericUtils
 from agents import Drone
 
 import wandb
+from comms.web_sockets.server import WSCommsHandler
+
+
+class RewardBuilder:
+    def __init__(
+            self, 
+            world_size, 
+            is_recency_enabled = False,
+            vp_size = 64
+        ):
+        self.world_size = world_size
+        self.is_recency_enabled = is_recency_enabled
+        self.vp_size = vp_size
+        pass
+
+    
+
+
+
+
 
 class SingleAgentEnv(gym.Env):
 
@@ -152,12 +172,6 @@ class SingleAgentEnv(gym.Env):
         self._w_fire_discovery = weights.get("fire_discovery", 1.0)
         self._w_fire_tracking  = weights.get("fire_tracking",  1.0)
         self._w_risk           = weights.get("risk",           1.0)
-
-        # self.env_state_dict["_w_exploration"] = self._w_exploration
-        # self.env_state_dict["_w_exploration_track"] = self._w_exploration_track
-        # self.env_state_dict["_w_fire_discovery"] = self._w_fire_discovery
-        # self.env_state_dict["_w_risk"] = self._w_risk
-
         print(f"[REWARD_WEIGHTS_UPDATE] -> exploration : {self._w_exploration} | fire discovery : {self._w_fire_discovery} | fire tracking : {self._w_fire_tracking} | risk : {self._w_risk}")
 
     def get_position_delta_from_action(self, action):
@@ -218,16 +232,7 @@ class SingleAgentEnv(gym.Env):
         self.agents = [f"agent_{i}" for i in range(self.n_agents)]
         self.agent_instances = [Drone.Drone(f"agent_{i}") for i in range(self.n_agents)]
 
-        fire_coords = np.argwhere(self.map[:, :, 1] > 0)
-        if len(fire_coords) > 0 and self._episode_count < -1:
-            scatter = self.vp_size * 3
-            self._agent_positions = []
-            for _ in range(self.n_agents):
-                centre = fire_coords[np.random.randint(len(fire_coords))]
-                px = int(np.clip(centre[0] + np.random.randint(-scatter, scatter), 0, self.world_size[0] - 1))
-                py = int(np.clip(centre[1] + np.random.randint(-scatter, scatter), 0, self.world_size[1] - 1))
-                self._agent_positions.append((px, py))
-        elif self.start_poss is not None:
+        if self.start_poss is not None:
             self._agent_positions = self.start_poss[:self.n_agents]
         else:
             self._agent_positions = [
@@ -257,8 +262,6 @@ class SingleAgentEnv(gym.Env):
             self._axes = None
 
         return obs, {}
-
-
 
     def exploration_reward(self, delta, local_view, c_delta=1, c_view=1):
         return (c_delta * (np.sum(delta[:, :, 0]) / self.vp_size**2)) + (c_view * (np.sum(local_view[:, :, 0]) / self.vp_size**2))
@@ -311,7 +314,7 @@ class SingleAgentEnv(gym.Env):
 
         return reward
     
-    def fire_proximity_bonus(self, px, py, ideal_dist_cells: float = 3.0) -> float:
+    def fire_proximity_bonus_inop(self, px, py, ideal_dist_cells: float = 3.0) -> float:
         """
         Small dense reward for being *near* but not *inside* fire.
         Peaks at `ideal_dist_cells` away from the nearest fire pixel and
@@ -683,7 +686,7 @@ class SingleAgentEnv(gym.Env):
                 + movement
                 - recency_pen
                 - boundary
-                - net_fire_cost     # replaces the old `- fire_cross` line
+                #- net_fire_cost     # replaces the old `- fire_cross` line
             )
 
             return reward
@@ -694,6 +697,7 @@ class SingleAgentEnv(gym.Env):
         If fire occupies a horizontal edge in the viewport, moving horizontally is rewarded.
         """
         total = 0.0
+        scene = self.view_acc.get_scene()
         for i, (delta, pos) in enumerate(zip(delta_views, self._agent_positions)):
             px, py = pos
             half = self.vp_size // 2
@@ -702,7 +706,7 @@ class SingleAgentEnv(gym.Env):
             y0 = np.clip(py - half, 0, self.world_size[1])
             y1 = np.clip(py + half, 0, self.world_size[1])
 
-            fire_patch = self.map[x0:x1, y0:y1, 1]
+            fire_patch = scene[x0:x1, y0:y1, 1]
             if not np.any(fire_patch > 0):
                 continue
 
@@ -838,8 +842,7 @@ class SingleAgentEnv(gym.Env):
             agent:Drone.Drone = self.agent_instances[i]
             agent_actions = action[self.actions_per_agent*i : self.actions_per_agent*(i+1)]   # for i-th agent, the corresponding action would be [2*i:2*1+1]
             
-            dx, dy = self.get_position_delta_from_action(agent_actions[0]), self.get_position_delta_from_action(agent_actions[1])
-            agent.inject_velocity({"x" : dx, "y":dy, "z": 0})
+            agent.inject_action(agent_actions)
 
             px, py = int(agent.get_position_array()[0]), int(agent.get_position_array()[1])
 
@@ -1377,7 +1380,117 @@ class SingleAgentEnv(gym.Env):
         metrics.update(self.get_revisit_delta_stats())
         return metrics
     
+
+
+
+
+
+
+
+# Overwritten base class for implementing differences in UE5 sim.
+class UE5AgentEnv(SingleAgentEnv):
+    def __init__(
+            self, 
+            n_agents, 
+            world_size, 
+            start_positions = None, 
+            iter_limit=4500, 
+            vp_size=64, 
+            seed=None, 
+            fixed_seed=False, 
+            env_id="UE5AgentEnv", 
+            render_mode="human", 
+            sample_interval=100, 
+            save_interval=500, 
+            is_vid_out=False, 
+            vid_base_path="./vids/", 
+            vid_id="test_", 
+            phase_weights = None, 
+            device=None
+        ):
+        super().__init__(n_agents, world_size, start_positions, iter_limit, vp_size, seed, fixed_seed, env_id, render_mode, sample_interval, save_interval, is_vid_out, vid_base_path, vid_id, phase_weights, device)
+        self._this_response = None
+
+    # use case specific helpers
+    def is_client_conn_established(self) -> bool:
+        return WSCommsHandler.instance().is_clients_connected()
+ 
+    
+    # overwrite step, reset calls.
+    def reset(self, seed=None, options=None):
+        if self._episode_count!=0 and self._episode_count % self.sample_int == 0:
+            if len(self._reward_history) > 10:
+                print(f"[RESET] Reward history - MAX : {np.max(self._reward_history[10:])} | MEAN : {np.mean(self._reward_history[10:])} | MIN : {np.min(self._reward_history[10:])}")
+
+
+        # Clear episode state without destroying the video writer or figure
+        self._obs_hsitory    = []
+        self._agent_positions = []
+        self._reward_history  = []
+        self._view_history    = []
+        self._pos_history     = []
+        self._step_count      = 0
+        self._episode_count  += 1
+        self._visited_frac    = 0.0
+        self._last_global_vp  = None
+
+        self.init_domain_logs()
+        self._init_revisit_tracker()
+
+        # Reset maps
+        self.visited_map   = np.zeros(self.world_size, dtype=np.bool_)
+        self.recency_map   = np.zeros(self.world_size, dtype=np.float32)
+        self.fire_disc_map = np.full(self.world_size, -1, dtype=np.int32)
+        self.view_acc.reset()
+
+        if not self.fixed_seed and self.seed is not None and self._episode_count > 10:
+            if ( (self._episode_count - 1) % self.map_update_interval == 0):
+                self.seed+=1
+                if self.stepped_map_update:
+                    self.map_update_interval = self.map_update_interval // 2
+                    if self.map_update_interval < 1:
+                        self.map_update_interval = 1
+
+        # Spawn agents
+        self.agents = [f"agent_{i}" for i in range(self.n_agents)]
+        self.agent_instances = None
         
+        if self.start_poss is not None:
+            self._agent_positions = self.start_poss[:self.n_agents]
+        else:
+            self._agent_positions = [
+                (np.random.randint(0, self.world_size[0]),
+                np.random.randint(0, self.world_size[1]))
+                for _ in range(self.n_agents)
+            ]
 
-            
+        for p, a in zip(self._agent_positions, self.agent_instances):
+            a.set_position({'x': p[0], 'y': p[1], 'z': 0})
 
+        # Seed pos_history so _build_positions_obs has something to diff on step 1
+        self._pos_history = [list(self._agent_positions)]
+
+        obs = {
+            "viewport":  np.zeros((3, 84, 84), dtype=np.float32),
+            "positions": self._build_positions_obs(),
+        }
+        
+        if self.out is not None:
+            self.out.release()
+            self.out = None
+        
+        if self._fig is not None:
+            plt.close(self._fig)
+            self._fig = None
+            self._axes = None
+
+        return obs, {}
+
+    def step(self, action):
+        return super().step(action)
+    
+    def _update_revisit_tracker(self):
+        return None
+    
+    def log_coverage_percentiles(self):
+        return None

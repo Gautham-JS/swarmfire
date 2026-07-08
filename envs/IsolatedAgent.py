@@ -23,7 +23,8 @@ class IsolatedAgentEnv(gym.Env):
     def __init__(
             self, 
             n_agents, 
-            world_size, 
+            world_size,
+            is_recency_learned = True, 
             start_positions:list=None, 
             iter_limit=4500, 
             vp_size=64,
@@ -51,6 +52,7 @@ class IsolatedAgentEnv(gym.Env):
         self.sample_int = sample_interval
         self.save_int = save_interval
         self.fixed_seed = fixed_seed
+        self.is_recency_learned = is_recency_learned
 
         if device is not None:
             self.device=device
@@ -78,18 +80,18 @@ class IsolatedAgentEnv(gym.Env):
 
         self.action_space = gym.spaces.MultiDiscrete([3] * (self.n_agents * 2))
 
-        # n_agents * (x, y, vx, vy, fire_dx, fire_dy, fire_dist) = n_agents * 7
+        self.n_obs_channels = 3 if self.is_recency_learned else 2
         self.observation_space = gym.spaces.Dict({
-            "viewport": gym.spaces.Box(low=0.0, high=1.0, shape=(2, 84, 84), dtype=np.float32),
+            "viewport": gym.spaces.Box(low=0.0, high=1.0, shape=(self.n_obs_channels, 84, 84), dtype=np.float32),
             "positions": gym.spaces.Box(low=-1.0, high=1.0, shape=(self.n_agents * 4,), dtype=np.float32)
         })
 
         self.world_gen = Generators.FuelMapGenerator(self.world_size)
-        self.view_acc = Viewpoint.IncrementalViewAccumulator(self.world_size, 2)
+        self.view_acc = Viewpoint.IncrementalViewAccumulator(self.world_size, self.n_obs_channels)
 
 
         # vars initialized by reset fn
-        self.map = None             # global map HxWx1
+        self.map = None             # global map HxWx1 [TODO: Remove]
         self.visited_map = None
         self.agents = None          # indexed list of N agents
         self._obs_hsitory = None    # history of all rewards n_agents x n_iters
@@ -169,6 +171,7 @@ class IsolatedAgentEnv(gym.Env):
             return 1 * self.step_size
         
     def extract_viewpoint(self, x, y):
+        # [TODO: dont use the map directly, grab from UE5 transport layer]
         fuel_view, recently_visited_fuel, delta_fuel_mask = Viewpoint.get_square_viewpoint_and_mark_visited(self.map[:, :, 0], self.visited_map, (x, y), size=self.vp_size)
         fire_view, recently_visited_fire, delta_fire_mask = Viewpoint.get_square_viewpoint_and_mark_visited(self.map[:, :, 1], self.visited_map, (x, y), size=self.vp_size)
         self.visited_map = recently_visited_fuel
@@ -176,9 +179,33 @@ class IsolatedAgentEnv(gym.Env):
         view[:, :, 0], view[:, :, 1] = fuel_view, fire_view
         deltas[:, :, 0], deltas[:, :, 1] = delta_fuel_mask, delta_fire_mask
         return view, deltas
+    
+    def check_and_update_seed(self):
+        # check if the seed updates in stages or in one go.
+        if not self.fixed_seed and self.seed is not None and self._episode_count > 10:
+            if ( (self._episode_count - 1) % self.map_update_interval == 0):
+                self.seed+=1
+                if self.stepped_map_update:
+                    self.map_update_interval = self.map_update_interval // 2
+                    if self.map_update_interval < 1:
+                        self.map_update_interval = 1
+
+    def init_agent_positions(self):
+        if self.start_poss is not None:
+            self._agent_positions = self.start_poss[:self.n_agents]
+        else:
+            self._agent_positions = [
+                (np.random.randint(0, self.world_size[0]),
+                np.random.randint(0, self.world_size[1]))
+                for _ in range(self.n_agents)
+            ]        
+        for p, a in zip(self._agent_positions, self.agent_instances):
+            a.set_position({'x': p[0], 'y': p[1], 'z': 0})
+
+        # Seed pos_history so _build_positions_obs has something to diff on step 1
+        self._pos_history = [list(self._agent_positions)]
 
     def reset(self, seed=None, options=None):
-
         if self._episode_count!=0 and self._episode_count % self.sample_int == 0:
             if len(self._reward_history) > 10:
                 print(f"[RESET] Reward history - MAX : {np.max(self._reward_history[10:])} | MEAN : {np.mean(self._reward_history[10:])} | MIN : {np.min(self._reward_history[10:])}")
@@ -204,46 +231,19 @@ class IsolatedAgentEnv(gym.Env):
         self.fire_disc_map = np.full(self.world_size, -1, dtype=np.int32)
         self.view_acc.reset()
 
-        if not self.fixed_seed and self.seed is not None and self._episode_count > 10:
-            if ( (self._episode_count - 1) % self.map_update_interval == 0):
-                self.seed+=1
-                if self.stepped_map_update:
-                    self.map_update_interval = self.map_update_interval // 2
-                    if self.map_update_interval < 1:
-                        self.map_update_interval = 1
-            
+        self.check_and_update_seed()
+        
+        # [TODO: remove]
         self.map = self.world_gen.create_map(0.001, 0.003, seed=self.seed)
 
-        # Spawn agents
+        # Spawn agents [future multi agency support]
         self.agents = [f"agent_{i}" for i in range(self.n_agents)]
         self.agent_instances = [Drone.Drone(f"agent_{i}") for i in range(self.n_agents)]
 
-        fire_coords = np.argwhere(self.map[:, :, 1] > 0)
-        if len(fire_coords) > 0 and self._episode_count < -1:
-            scatter = self.vp_size * 3
-            self._agent_positions = []
-            for _ in range(self.n_agents):
-                centre = fire_coords[np.random.randint(len(fire_coords))]
-                px = int(np.clip(centre[0] + np.random.randint(-scatter, scatter), 0, self.world_size[0] - 1))
-                py = int(np.clip(centre[1] + np.random.randint(-scatter, scatter), 0, self.world_size[1] - 1))
-                self._agent_positions.append((px, py))
-        elif self.start_poss is not None:
-            self._agent_positions = self.start_poss[:self.n_agents]
-        else:
-            self._agent_positions = [
-                (np.random.randint(0, self.world_size[0]),
-                np.random.randint(0, self.world_size[1]))
-                for _ in range(self.n_agents)
-            ]
-
-        for p, a in zip(self._agent_positions, self.agent_instances):
-            a.set_position({'x': p[0], 'y': p[1], 'z': 0})
-
-        # Seed pos_history so _build_positions_obs has something to diff on step 1
-        self._pos_history = [list(self._agent_positions)]
+        self.init_agent_positions()
 
         obs = {
-            "viewport":  np.zeros((2, 84, 84), dtype=np.float32),
+            "viewport":  np.zeros((self.n_obs_channels, 84, 84), dtype=np.float32),
             "positions": self._build_positions_obs(),
         }
         
@@ -258,22 +258,18 @@ class IsolatedAgentEnv(gym.Env):
 
         return obs, {}
 
-
-
     def exploration_reward(self, delta, local_view, c_delta=1, c_view=1):
         return (c_delta * (np.sum(delta[:, :, 0]) / self.vp_size**2)) + (c_view * (np.sum(local_view[:, :, 0]) / self.vp_size**2))
     
     def fire_reward(self, delta, local_view, c_fd = 1, c_ft=1):
         return (c_fd * (np.sum(delta[:, :, 1]) / self.vp_size**2)) + (c_ft * (np.sum(local_view[:, :, 1]) / self.vp_size**2))
     
-
+    """
+        [REWARD COMPONENT]
+    """
     def recency_penality(self, px, py, c_rp=10):
         recency_patch = self.extract_recency_map(px, py)
         return float(np.mean(recency_patch)) * c_rp
-    
-    def novelty_reward(self, px, py, c_rp=5):
-        recency_patch = self.extract_recency_map(px, py)
-        return (1 - float(np.mean(recency_patch)) ) * c_rp
 
 
     def mark_all_recency(self):
@@ -281,80 +277,12 @@ class IsolatedAgentEnv(gym.Env):
             px, py = pos
             self.mark_recency_map(px, py)
 
-
-    def calculate_reward_shelved(self, delta_views, recency_map):
-        step_advantage = 1.4 * (1 + (
-            1 - GenericUtils.normalize_data(self._step_count, 0, self.iter_limit)
-        ))
-
-        reward = 0.0
-        nb_penality = 0.0
-
-        for i, (delta, pos) in enumerate(zip(delta_views, self._agent_positions)):
-            px, py = pos
-            half = self.vp_size // 2
-            x0 = np.clip(px - half, 0, self.world_size[0])
-            x1 = np.clip(px + half, 0, self.world_size[0])
-            y0 = np.clip(py - half, 0, self.world_size[1])
-            y1 = np.clip(py + half, 0, self.world_size[1])
-
-            local_view = self.view_acc.get_scene()[x0:x1, y0:y1, :]
-            
-            nb_penality += self.calculate_near_boundary_penalty(px, py)
-
-            reward += self.exploration_reward(delta, local_view, c_delta=5.5, c_view=0.7)
-            reward += self.fire_reward(delta, local_view, c_fd=9.5, c_ft=1.3)
-            #reward += self.novelty_reward(px, py)
-
-            reward -= nb_penality
-            reward -= self.recency_penality(px, py, c_rp=2)
-
-        return reward
-    
-    def fire_proximity_bonus(self, px, py, ideal_dist_cells: float = 3.0) -> float:
-        """
-        Small dense reward for being *near* but not *inside* fire.
-        Peaks at `ideal_dist_cells` away from the nearest fire pixel and
-        falls off as a Gaussian on either side, so the agent is pulled
-        toward the perimeter without being rewarded for entering fire.
-
-        Returns a positive scalar to be ADDED to the reward.
-        """
-        cx = int(np.clip(px, 0, self.world_size[0] - 1))
-        cy = int(np.clip(py, 0, self.world_size[1] - 1))
-
-        # Standing inside fire → no proximity bonus (crossing penalty handles it)
-        if self.map[cx, cy, 1] > 0:
-            return 0.0
-
-        half = self.vp_size // 2
-        x0 = int(np.clip(px - half, 0, self.world_size[0]))
-        x1 = int(np.clip(px + half, 0, self.world_size[0]))
-        y0 = int(np.clip(py - half, 0, self.world_size[1]))
-        y1 = int(np.clip(py + half, 0, self.world_size[1]))
-
-        fire_patch = self.map[x0:x1, y0:y1, 1]
-        fire_coords = np.argwhere(fire_patch > 0)
-        if len(fire_coords) == 0:
-            return 0.0
-
-        # Distance from patch-local agent centre to nearest fire pixel
-        local_cx = cx - x0
-        local_cy = cy - y0
-        diffs = fire_coords - np.array([local_cx, local_cy])
-        dist  = float(np.min(np.linalg.norm(diffs, axis=1)))
-
-        # Gaussian centred on `ideal_dist_cells`
-        sigma  = ideal_dist_cells * 0.8
-        bonus  = 3.0 * np.exp(-0.5 * ((dist - ideal_dist_cells) / sigma) ** 2)
-        return float(bonus)
-
-
-    def calculate_near_boundary_penalty(self, x, y):
-        """
+    """
+        [REWARD COMPONENT]
         Exponential penalty that grows sharply as agent approaches the wall.
         Increased scale so it decisively dominates any wall-camping reward.
-        """
+    """
+    def calculate_near_boundary_penalty(self, x, y):
         margin = self.vp_size // 2
         penalty = 0.0
         for coord, limit in [(x, self.world_size[0]), (y, self.world_size[1])]:
@@ -367,14 +295,13 @@ class IsolatedAgentEnv(gym.Env):
         # Removed the 0.5 discount — boundary must hurt more than staying pays
         return penalty
 
-
-    def _viewport_coverage_fraction(self, px, py) -> float:
-        """
+    """
         Returns the fraction of the viewport that lies within world bounds [0, 1].
         Used to scale down rewards when the agent is near a wall and half its
         viewport is zero-padded — prevents the agent from getting free reward
         for looking at nothing.
-        """
+    """
+    def _viewport_coverage_fraction(self, px, py) -> float:
         half = self.vp_size // 2
         x0 = max(px - half, 0);  x1 = min(px + half, self.world_size[0])
         y0 = max(py - half, 0);  y1 = min(py + half, self.world_size[1])
@@ -384,18 +311,10 @@ class IsolatedAgentEnv(gym.Env):
 
 
     """
-    These functions added for promoting fire crossing if significant area is still unexplored behind the fire:
+        [REWARD COMPONENT]
+        These functions added for promoting fire crossing if significant area is still unexplored behind the fire:
     """
-
     def calculate_fire_crossing_penalty(self, px, py) -> float:
-        """
-        Penalty when the agent is at a position it has previously seen as fire
-        in its accumulated observation. Uses view_acc instead of ground truth map.
-        
-        Note: this will only penalize crossings of *known* fire — fire the agent
-        has never seen won't trigger this, which is realistic (the drone doesn't
-        know it's flying into unknown fire until it sees it).
-        """
         cx = int(np.clip(px, 0, self.world_size[0] - 1))
         cy = int(np.clip(py, 0, self.world_size[1] - 1))
 
@@ -408,12 +327,12 @@ class IsolatedAgentEnv(gym.Env):
         base_penalty = 80.0
         return base_penalty * (0.5 + 0.5 * fire_value)
 
-
-    def fire_perimeter_alignment_reward(self, delta_views) -> float:
-        """
+    """
+        [REWARD COMPONENT]
         Rewards moving tangentially along the fire boundary as seen in the
         accumulated observation, not the ground truth map.
-        """
+    """
+    def fire_perimeter_alignment_reward(self, delta_views) -> float:
         from scipy.ndimage import sobel
 
         scene = self.view_acc.get_scene()
@@ -427,7 +346,6 @@ class IsolatedAgentEnv(gym.Env):
             y0 = int(np.clip(py - half, 0, self.world_size[1]))
             y1 = int(np.clip(py + half, 0, self.world_size[1]))
 
-            # Use accumulated scene instead of self.map
             fire_patch = scene[x0:x1, y0:y1, 1]
             if not np.any(fire_patch > 0):
                 continue
@@ -461,20 +379,18 @@ class IsolatedAgentEnv(gym.Env):
             vel_dir   = vel / vel_norm
             alignment = float(np.dot(vel_dir, boundary_tangent))
             total    += max(0.0, alignment) * 12.0
-
         return total
 
-
-    def fire_proximity_bonus(self, px, py, ideal_dist_cells: float = 2.0) -> float:
-        """
+    """
+        [REWARD COMPONENT]
         Gaussian bonus for being near but not inside known fire,
         derived from the accumulated observation.
-        """
+    """
+    def fire_proximity_bonus(self, px, py, ideal_dist_cells: float = 2.0) -> float:
         cx = int(np.clip(px, 0, self.world_size[0] - 1))
         cy = int(np.clip(py, 0, self.world_size[1] - 1))
 
         scene = self.view_acc.get_scene()
-
         # No bonus if standing in known fire
         if scene[cx, cy, 1] > 0:
             return 0.0
@@ -499,20 +415,23 @@ class IsolatedAgentEnv(gym.Env):
         return float(3.0 * np.exp(-0.5 * ((dist - ideal_dist_cells) / sigma) ** 2))
 
 
-    def _estimate_occluded_area(self, px, py) -> float:
-        """
+    """
+        [REWARD COMPONENT]
         Estimates unseen area occluded by *known* fire in the accumulated scene.
 
         Rays are cast outward. Once a ray crosses a known-fire cell, everything
         beyond that is still unvisited counts as occluded potential.
-        
+    
         The key difference from the ground-truth version: we treat cells that
         are both unvisited AND beyond known fire as occluded. Cells that are
         simply unvisited but not beyond fire are just unexplored — the agent
         should explore those via normal exploration reward, not fire-crossing.
-        """
+
+        [TODO: Modularize params as env params]
+    """
+    def _estimate_occluded_area(self, px, py) -> float:
         scene      = self.view_acc.get_scene()
-        n_rays     = 16
+        n_rays     = 8
         max_range  = int(max(self.world_size) * 0.75)
         step_size  = 2
         occluded   = 0
@@ -552,14 +471,14 @@ class IsolatedAgentEnv(gym.Env):
 
         return float(occluded) / float(total_rays)
 
-
-    def _fire_crossing_opportunity_reward(self, px, py) -> float:
-        """
+    """
+        [REWARD COMPONENT]
         Counteracts the crossing penalty when crossing known fire gives access
         to a large unseen area beyond it, and the local fire patch is thin.
         
         Both fire presence and fire density measured from accumulated scene.
-        """
+    """
+    def _fire_crossing_opportunity_reward(self, px, py) -> float:
         cx = int(np.clip(px, 0, self.world_size[0] - 1))
         cy = int(np.clip(py, 0, self.world_size[1] - 1))
 
@@ -584,14 +503,14 @@ class IsolatedAgentEnv(gym.Env):
 
         opportunity = occluded_fraction * thinness
         return opportunity * 150.0
-
-    def _corner_escape_bonus(self, px, py, prev_px, prev_py) -> float:
-        """
+    """
+        [REWARD COMPONENT]
         Returns a positive bonus when the agent moves away from the corner
         it is closest to, measured as Euclidean distance to the nearest corner.
         This fires even when moving_away from the nearest *wall* is ambiguous
         (e.g. diagonal corners where both walls are equidistant).
-        """
+    """
+    def _corner_escape_bonus(self, px, py, prev_px, prev_py) -> float:
         corners = [
             (0, 0),
             (0, self.world_size[1]),
@@ -603,11 +522,11 @@ class IsolatedAgentEnv(gym.Env):
 
         prev_dist = min_corner_dist(prev_px, prev_py)
         curr_dist = min_corner_dist(px, py)
-        return max(0.0, curr_dist - prev_dist) * 3.5   # scale as needed
+        return max(0.0, curr_dist - prev_dist) * 3.5   # scale, [TODO: Convert to env param]
     
+
     def calculate_reward(self, delta_views, recency_map):
         reward = 0.0
-
         step_advantage = 2.0 * (1.0 + (
             1.0 - GenericUtils.normalize_data(self._step_count, 0, self.iter_limit)
         ))
@@ -634,14 +553,14 @@ class IsolatedAgentEnv(gym.Env):
             perimeter_reward = self._w_fire_tracking * self.fire_perimeter_alignment_reward([delta]) * vp_scale
             proximity        = self.fire_proximity_bonus(px, py) * vp_scale
 
-            # ── Crossing opportunity — net out the penalty when crossing is smart ─
+            # Crossing opportunity reward - net out the penalty when crossing is smart
             crossing_opportunity = self._fire_crossing_opportunity_reward(px, py)
             fire_cross           = self._w_risk * self.calculate_fire_crossing_penalty(px, py)
             # Net fire cost: penalty minus opportunity. Can go positive (net reward)
             # when crossing is strategically valuable, negative (net penalty) otherwise.
             net_fire_cost = fire_cross - crossing_opportunity
 
-            # ── Movement ──────────────────────────────────────────────────────────
+            # Movement reward
             if len(self._pos_history) >= 2:
                 prev  = self._pos_history[-2][i]
                 curr  = self._pos_history[-1][i]
@@ -668,9 +587,7 @@ class IsolatedAgentEnv(gym.Env):
                     movement = -1.5
             else:
                 movement = 0.0
-
             recency     = float(np.mean(self.extract_recency_map(px, py)))
-
             recency_pen = (math.exp(recency) - 1) / (math.exp(1) - 1) * 140
             boundary    = self.calculate_near_boundary_penalty(px, py)
 
@@ -683,61 +600,10 @@ class IsolatedAgentEnv(gym.Env):
                 + movement
                 - recency_pen
                 - boundary
-                - net_fire_cost     # replaces the old `- fire_cross` line
+                - net_fire_cost     # replaces the old "fire_cross" component
             )
 
             return reward
-
-    def _fire_boundary_tracking_reward(self, delta_views) -> float:
-        """
-        Rewards agents whose velocity aligns with the local fire boundary direction.
-        If fire occupies a horizontal edge in the viewport, moving horizontally is rewarded.
-        """
-        total = 0.0
-        for i, (delta, pos) in enumerate(zip(delta_views, self._agent_positions)):
-            px, py = pos
-            half = self.vp_size // 2
-            x0 = np.clip(px - half, 0, self.world_size[0])
-            x1 = np.clip(px + half, 0, self.world_size[0])
-            y0 = np.clip(py - half, 0, self.world_size[1])
-            y1 = np.clip(py + half, 0, self.world_size[1])
-
-            fire_patch = self.map[x0:x1, y0:y1, 1]
-            if not np.any(fire_patch > 0):
-                continue
-
-            # Compute fire boundary normal using Sobel gradient
-            from scipy.ndimage import sobel
-            gx = sobel(fire_patch, axis=1)
-            gy = sobel(fire_patch, axis=0)
-
-            # Mean gradient direction at the boundary
-            mag = np.sqrt(gx**2 + gy**2)
-            if mag.sum() < 1e-6:
-                continue
-            boundary_normal = np.array([
-                np.sum(gy * mag) / mag.sum(),
-                np.sum(gx * mag) / mag.sum()
-            ])
-            boundary_normal /= (np.linalg.norm(boundary_normal) + 1e-8)
-
-            # Tangent to boundary = perpendicular to normal
-            boundary_tangent = np.array([-boundary_normal[1], boundary_normal[0]])
-
-            # Agent velocity direction this step
-            if len(self._pos_history) >= 2:
-                prev_pos = self._pos_history[-2][i]
-                curr_pos = self._pos_history[-1][i]
-                vel = np.array([curr_pos[0] - prev_pos[0],
-                                curr_pos[1] - prev_pos[1]], dtype=np.float32)
-                vel_norm = np.linalg.norm(vel)
-                if vel_norm > 1e-6:
-                    vel_dir = vel / vel_norm
-                    # Alignment with tangent — ranges [-1, 1], reward only positive
-                    alignment = float(np.dot(vel_dir, boundary_tangent))
-                    total += max(0.0, alignment) * 2.0
-
-        return total
 
     def mark_recency_map(self, px, py):
         half = self.vp_size // 2
@@ -745,10 +611,7 @@ class IsolatedAgentEnv(gym.Env):
         x1 = np.clip(px + half, 0, self.world_size[0])
         y0 = np.clip(py - half, 0, self.world_size[1])
         y1 = np.clip(py + half, 0, self.world_size[1])
-        # self.recency_map[x0:x1, y0:y1] = np.maximum(
-        #     self.recency_map[x0:x1, y0:y1],
-        #     self._recency_visit_bump
-        # )
+
         self.recency_map[x0:x1, y0:y1] += self._recency_visit_bump
         self.recency_map[x0:x1, y0:y1] = np.minimum(self.recency_map[x0:x1, y0:y1], np.ones((x1 - x0, y1 - y0), dtype=np.float32))
 
@@ -805,19 +668,6 @@ class IsolatedAgentEnv(gym.Env):
             obs.append(np.clip(vx, -1, 1))
             obs.append(np.clip(vy, -1, 1))
 
-            # Direction to nearest known fire (or zeros if none)
-            # if len(fire_coords) > 0:
-            #     diffs = fire_coords - np.array([px, py])
-            #     dists = np.linalg.norm(diffs, axis=1)
-            #     nearest = diffs[np.argmin(dists)]
-            #     dist = dists.min()
-            #     fire_dir = nearest / (dist + 1e-8)
-            #     obs.append(float(np.clip(fire_dir[0], -1, 1)))
-            #     obs.append(float(np.clip(fire_dir[1], -1, 1)))
-            #     obs.append(float(np.clip(dist / max(self.world_size), 0, 1)))
-            # else:
-            #     obs.extend([0.0, 0.0, 1.0])  # no fire known, max distance
-
         return np.asarray(obs, dtype=np.float32)
 
     def step(self, action):
@@ -858,7 +708,8 @@ class IsolatedAgentEnv(gym.Env):
 
             view, delta_view = self.extract_viewpoint(px, py)
             view_recency = self.extract_recency_map(px, py)
-
+            
+            # [TODO: dont use the map directly, grab from UE5 transport layer]
             view_fuel = Viewpoint.get_square_viewpoint(self.map[:, :, 0], (px, py), self.vp_size)
             view_fire = Viewpoint.get_square_viewpoint(self.map[:, :, 1], (px, py), self.vp_size)
             view_agent = np.stack([view_fuel, view_fire], axis=0)  # (2, vp_size, vp_size)
@@ -1244,6 +1095,7 @@ class IsolatedAgentEnv(gym.Env):
     
     # Domain specific metrics for evaluation of performance
 
+    # TODO: Cannot use global self.map to measure this. Need to detach generated map and live feed map.
     def _update_revisit_tracker(self):
         """
         Call once per step, AFTER agent positions are updated and viewports extracted.
@@ -1263,7 +1115,7 @@ class IsolatedAgentEnv(gym.Env):
         # Only care about cells that are actually fire
         is_fire = self.map[:, :, 1] > 0
 
-        #  Transition: visited → absent 
+        # Transition: visited to absent 
         leaving = (self._revisit_state == 1) & ~in_viewport & is_fire
         self._revisit_last_seen[leaving] = self._step_count
         self._revisit_state[leaving] = 2

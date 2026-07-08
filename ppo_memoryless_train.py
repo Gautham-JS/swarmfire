@@ -28,9 +28,9 @@ from envs.SingleAgentEnv import SingleAgentEnv
 from envs.IsolatedAgent import IsolatedAgentEnv
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# 
 # Config
-# ─────────────────────────────────────────────────────────────────────────────
+# 
 
 @dataclass
 class Config:
@@ -84,9 +84,9 @@ class Config:
     wandb_api_key:    str   = "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"
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# 
 # Running reward normaliser
-# ─────────────────────────────────────────────────────────────────────────────
+# 
 
 class RunningMeanStd:
     def __init__(self, epsilon=1e-4):
@@ -113,9 +113,9 @@ class RunningMeanStd:
         return np.clip(normed, -clip, clip).astype(np.float32)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# 
 # MLP feature extractor
-# ─────────────────────────────────────────────────────────────────────────────
+# 
 
 class MLPExtractor(nn.Module):
     """
@@ -144,9 +144,9 @@ class MLPExtractor(nn.Module):
         return self.net(x)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# 
 # Actor-Critic
-# ─────────────────────────────────────────────────────────────────────────────
+# 
 
 class MLPActorCritic(nn.Module):
     def __init__(self, observation_space, action_nvec, cfg: Config):
@@ -182,9 +182,9 @@ class MLPActorCritic(nn.Module):
         return action, log_prob, entropy, value
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# 
 # Rollout buffer  (no memory snapshots)
-# ─────────────────────────────────────────────────────────────────────────────
+# 
 
 class RolloutBuffer:
     def __init__(self, n_steps, n_envs, obs_space, action_nvec,
@@ -261,9 +261,9 @@ class RolloutBuffer:
             )
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# 
 # Observation helpers
-# ─────────────────────────────────────────────────────────────────────────────
+# 
 
 def vec_obs_to_tensor(obs_dict, device):
     return {k: torch.tensor(v, dtype=torch.float32).to(device) for k, v in obs_dict.items()}
@@ -272,9 +272,9 @@ def single_obs_to_tensor(obs_dict, device):
     return {k: torch.tensor(v, dtype=torch.float32).unsqueeze(0).to(device) for k, v in obs_dict.items()}
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# 
 # Environment factory
-# ─────────────────────────────────────────────────────────────────────────────
+# 
 
 def make_env_fn(cfg: Config, rank: int):
     def _init():
@@ -297,9 +297,9 @@ def make_env_fn(cfg: Config, rank: int):
     return _init
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# 
 # Evaluation
-# ─────────────────────────────────────────────────────────────────────────────
+# 
 
 def evaluate(agent, cfg, device, n_episodes=5):
     eval_env   = make_env_fn(cfg, rank=99)()
@@ -322,9 +322,9 @@ def evaluate(agent, cfg, device, n_episodes=5):
     return float(np.mean(ep_rewards))
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# 
 # Main training loop
-# ─────────────────────────────────────────────────────────────────────────────
+# 
 
 def train(cfg: Config, checkpoint_path=None):
     os.environ["WANDB_API_KEY"] = cfg.wandb_api_key
@@ -650,9 +650,9 @@ def train(cfg: Config, checkpoint_path=None):
     envs.close()
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# 
 # Entry point
-# ─────────────────────────────────────────────────────────────────────────────
+# 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="CleanRL PPO - FireScout (parallel)")

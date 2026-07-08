@@ -28,8 +28,17 @@ import wandb
 from gymnasium.wrappers import TimeLimit
 from stable_baselines3.common.vec_env import SubprocVecEnv
 from envs.WindSingleAgentEnv import SingleAgentEnv
-from envs.IsolatedAgent import IsolatedAgentEnv
+# from envs.IsolatedAgent import IsolatedAgentEnv // INOP for refactors
 from policies.TrXL import TrXLExtractor
+
+import logging
+
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+)
+
 
 
 # 
@@ -41,9 +50,9 @@ class Config:
     run_id:           str   = None
 
     # Environment
-    world_size:       tuple = (512, 512)
+    world_size:       tuple = (512 * 2, 512 * 2)
     n_agents:         int   = 1
-    iter_limit:       int   = 512
+    iter_limit:       int   = 1024
     seed:             int   = None
     n_envs:           int   = 8          # parallel environments
 
@@ -393,8 +402,8 @@ def make_env_fn(cfg: Config, rank: int):
             world_size      = cfg.world_size,
             start_positions = [(cfg.world_size[0] // 2, cfg.world_size[1] // 2)],
             render_mode     = "rgb_array" if rank == 0 else "rgb_array",
-            sample_interval = 5      if rank == 0 else 999999,
-            save_interval   = 5      if rank == 0 else 999999,
+            sample_interval = 20      if rank == 0 else 999999,
+            save_interval   = 20      if rank == 0 else 999999,
             seed            = cfg.seed + rank if cfg.seed is not None else None,   # different seed per env
             fixed_seed      = False,
             is_vid_out      = (rank == 0),
@@ -451,7 +460,7 @@ def train(cfg: Config, checkpoint_path=None):
     wandb.init(project=cfg.wandb_project, config=vars(cfg))
 
     cfg.run_id = wandb.run.name
-    print(f"[Train] : Begin training session with ID : {cfg.run_id}")
+    logging.info(f"[Train] : Begin training session with ID : {cfg.run_id}")
 
     os.makedirs(cfg.checkpoint_dir, exist_ok=True)
     os.makedirs(cfg.best_model_dir, exist_ok=True)
@@ -462,7 +471,7 @@ def train(cfg: Config, checkpoint_path=None):
         torch.manual_seed(cfg.seed)
 
     device = torch.device("cuda:1" if torch.cuda.is_available() else "cpu")
-    print(f"[INIT] Device: {device} | N envs: {cfg.n_envs}")
+    logging.info(f"[INIT] Device: {device} | N envs: {cfg.n_envs}")
 
     torch.backends.cudnn.benchmark        = True
     torch.backends.cuda.matmul.allow_tf32 = True
@@ -484,7 +493,7 @@ def train(cfg: Config, checkpoint_path=None):
 
     # ── Checkpoint loading ────────────────────────────────────────────────────
     if checkpoint_path is not None:
-        print(f"[INIT] Loading checkpoint: {checkpoint_path}")
+        logging.info(f"[INIT] Loading checkpoint: {checkpoint_path}")
         ckpt             = torch.load(checkpoint_path, map_location=device)
         agent.load_state_dict(ckpt["agent"])
         optimizer.load_state_dict(ckpt["optimizer"])
@@ -494,7 +503,7 @@ def train(cfg: Config, checkpoint_path=None):
         recent_rewards   = deque(ckpt.get("recent_rewards", []), maxlen=100)
         next_ckpt_step   = global_step + cfg.checkpoint_freq
         next_eval_step   = global_step + cfg.eval_freq
-        print(f"[INIT] Resumed from step {global_step}")
+        logging.info(f"[INIT] Resumed from step {global_step}")
     else:
         recent_rewards = deque(maxlen=100)
         next_ckpt_step = cfg.checkpoint_freq
@@ -542,7 +551,7 @@ def train(cfg: Config, checkpoint_path=None):
 
     agent.extractor.init_memory(batch_size=cfg.n_envs, device=device)
 
-    print(f"[TRAIN] Starting - {cfg.total_timesteps:,} steps | "
+    logging.info(f"[TRAIN] Starting - {cfg.total_timesteps:,} steps | "
           f"rollout size = {cfg.n_steps * cfg.n_envs:,} transitions")
     start_time = time.time()
 
@@ -720,7 +729,7 @@ def train(cfg: Config, checkpoint_path=None):
                 scatter_kl_data.append([approx_kl, ent])
 
             if kl_divs and np.mean(kl_divs) > cfg.target_kl:
-                print(f"[PPO] Early stop at epoch {epoch+1}, KL={np.mean(kl_divs):.4f}")
+                logging.info(f"[PPO] Early stop at epoch {epoch+1}, KL={np.mean(kl_divs):.4f}")
                 stop_early = True
 
         # Detach memory 
@@ -762,7 +771,7 @@ def train(cfg: Config, checkpoint_path=None):
         scatter_loss_data = []   # flush each rollout
         scatter_kl_data   = []
 
-        print(
+        logging.info(
             f"[{global_step:>8}] "
             f"pl={mean_pl:.4f} vl={mean_vl:.4f} "
             f"ent={mean_ent:.4f} kl={mean_kl:.4f} "
@@ -784,13 +793,13 @@ def train(cfg: Config, checkpoint_path=None):
                     "count": reward_rms.count,
                 },
             }, ckpt_path)
-            print(f"[CKPT] Saved : {ckpt_path}")
+            logging.info(f"[CKPT] Saved : {ckpt_path}")
             next_ckpt_step += cfg.checkpoint_freq
 
         # ── Evaluation ────────────────────────────────────────────────────────
         if global_step >= next_eval_step:
             eval_reward = evaluate(agent, cfg, device, cfg.n_eval_episodes)
-            print(f"[EVAL] step={global_step} mean_reward={eval_reward:.3f}")
+            logging.info(f"[EVAL] step={global_step} mean_reward={eval_reward:.3f}")
             wandb.log({"eval/mean_reward": eval_reward, "global_step": global_step})
 
             if eval_reward > best_eval_reward:
@@ -801,7 +810,7 @@ def train(cfg: Config, checkpoint_path=None):
                     "global_step":      global_step,
                     "best_eval_reward": best_eval_reward,
                 }, os.path.join(cfg.best_model_dir, "best_model.pt"))
-                print(f"[EVAL] New best : {best_eval_reward:.3f}")
+                logging.info(f"[EVAL] New best : {best_eval_reward:.3f}")
 
             agent.extractor.init_memory(batch_size=cfg.n_envs, device=device)
             next_eval_step += cfg.eval_freq
@@ -813,7 +822,7 @@ def train(cfg: Config, checkpoint_path=None):
         "global_step":      global_step,
         "best_eval_reward": best_eval_reward,
     }, "./firescout_final.pt")
-    print("[DONE] Training complete.")
+    logging.info("[DONE] Training complete.")
     wandb.finish()
     envs.close()
 

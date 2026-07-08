@@ -65,11 +65,17 @@ class AgentGenerators:
 
 
 
+import numpy as np
+from scipy.ndimage import gaussian_filter
+from skimage.morphology import dilation, disk, erosion # Added erosion for consistency in tree mask methods
+
+
 class FuelMapGenerator:
     def __init__(self, size):
         self.size = size
-        self.fire_gen = FireClusterMapGenerator(self.size)
-    
+        # Assuming FireClusterMapGenerator is defined elsewhere and used here
+        # self.fire_gen = FireClusterMapGenerator(self.size) 
+
     from scipy.ndimage import gaussian_filter
     from skimage.morphology import dilation, disk
 
@@ -83,10 +89,10 @@ class FuelMapGenerator:
         angle = np.random.uniform(0, 2*np.pi)
         magnitude = max(0.1, np.random.normal(magnitude_mean, magnitude_std))
 
-        wx = magnitude * np.cos(angle)
-        wy = magnitude * np.sin(angle)
+        wx = np.cos(angle)
+        wy = np.sin(angle)
 
-        return wx, wy
+        return wx, wy, magnitude
 
 
     def generate_fire_field_clustered(
@@ -154,7 +160,7 @@ class FuelMapGenerator:
         field = self.generate_fire_field_clustered(shape, seed=seed, num_regions=num_regions)
 
         # wind
-        wx, wy = self.generate_wind_field(shape, seed=seed)
+        wx, wy, _ = self.generate_wind_field(shape, seed=seed)
 
         # coordinate grid (for wind bias)
         y, x = np.meshgrid(np.arange(H), np.arange(W), indexing='ij')
@@ -202,6 +208,61 @@ class FuelMapGenerator:
             masks.append(mask_lines.astype(np.uint8))
 
         return masks, (wx, wy)
+
+
+    # --- NEW FUNCTION FOR DATA AUGMENTATION ---
+    def generate_multi_blob_fire_field(
+        self,
+        shape,
+        num_blobs=5,
+        avg_radius=20,
+        radius_std=10,
+        seed=None
+    ):
+        """
+        Generates a single static fire map composed of multiple randomized, overlapping blobs.
+        This serves as the alternative (data augmentation) method for fire generation.
+        """
+        if seed is not None:
+            np.random.seed(seed)
+
+        H, W = shape
+
+        # Start with an empty mask
+        fire_mask = np.zeros((H, W), dtype=np.uint8)
+
+        for _ in range(num_blobs):
+            # Random center coordinates
+            y_center = np.random.randint(0, H)
+            x_center = np.random.randint(0, W)
+
+            # Random radius/size for this blob
+            radius = max(5, np.random.normal(avg_radius, radius_std))
+            
+            # Create a circular Gaussian hot spot around the center
+            y_coords, x_coords = np.ogrid[:H, :W]
+            dist_squared = (x_coords - x_center)**2 + (y_coords - y_center)**2
+            
+            # Use a normalized Gaussian falloff for the intensity
+            blob_intensity = np.exp(-np.sqrt(dist_squared) / radius) 
+
+            # Normalize and scale the blob to create a visible hot zone
+            blob = (blob_intensity - blob_intensity.min()) / (blob_intensity.max() - blob_intensity.min())
+            
+            # Apply an initial threshold/smoothing before combining
+            if blob.max() > 0:
+                blob = gaussian_filter(blob, sigma=2)
+
+            # Accumulate the blobs (using OR operation or summation)
+            fire_mask = np.maximum(fire_mask, blob * 1.0)
+
+
+        # Final thresholding to get a binary mask and normalization if necessary
+        final_mask = fire_mask > 0.4 # Threshold determines how faint a spot counts as "on fire"
+
+        return final_mask.astype(np.uint8)
+    # --- END NEW FUNCTION ---
+
 
     def generate_tree_mask_fastest(
             self,
@@ -265,6 +326,20 @@ class FuelMapGenerator:
         return mask.astype(np.uint8)
     
     def create_map(self, canopy_density_alive, canopy_density_dead, canopy_size_mean=8, merge_radius=3, seed=None):
+        # Determine which fire generation method to use (random switch for augmentation)
+        use_blob_generation = np.random.rand() < 0.5 # 50% chance of using the new blob generator
+
+        if use_blob_generation:
+            print("--- Using Multi-Blob Fire Generation (Augmentation Mode) ---")
+            fire_mask = self.generate_multi_blob_fire_field(self.size, num_blobs=8, avg_radius=25, radius_std=15, seed=seed)
+        else:
+            print("--- Using Time-Series Fire Generation (Original Mode) ---")
+            # Original fire generation method
+            fire_masks, _ = self.generate_fire_perimeter_timeseries(self.size, 
+                                                                    timesteps=1, fronts_per_step=30, edge_sigma=0.5, growth_rate=0.03, wind_strength=1.0, seed=seed, num_regions=3)
+            fire_mask = fire_masks[0]
+
+
         tree_mask_base = self.generate_tree_mask_fastest(
             self.size,
             canopy_density=canopy_density_alive,
@@ -286,17 +361,16 @@ class FuelMapGenerator:
 
         world_map = np.zeros((self.size[0], self.size[0], 2), dtype=np.float32)
 
-        fire_masks, wind_vectors = self.generate_fire_perimeter_timeseries(self.size, 1, width_mean=2, fronts_per_step=10, edge_sigma=0.5, growth_rate=0.03, wind_strength=1.0, seed=seed, num_regions=3)
-        # fire_masks = self.fire_gen.create_map(seed=seed)
-        fire_mask = fire_masks[0]
-        
+        # wind field generation remains the same
+        wind_field = self.generate_wind_field(self.size, seed=seed)
+
         w = 0.7
         forest_fuel_map = (w * tree_mask_base) + ((1-w) * tree_mask_dead)
         world_map[:, :, 0] = forest_fuel_map
         world_map[:, :, 1] = fire_mask
 
 
-        return world_map
+        return world_map, wind_field
     
 
 from scipy.special import comb
