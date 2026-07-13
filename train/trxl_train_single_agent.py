@@ -27,9 +27,8 @@ import wandb
 
 from gymnasium.wrappers import TimeLimit
 from stable_baselines3.common.vec_env import SubprocVecEnv
-from envs.WindSingleAgentEnv import SingleAgentEnv
 # from envs.IsolatedAgent import IsolatedAgentEnv // INOP for refactors
-from envs.WildfireSingleAgentEnv import WildfireSingleAgentEnv
+from envs.WildfireSingleAgentEnv import SingleAgentEnv
 from config.Config import VideoWriterConfig, EnvConfig
 from policies.TrXL import TrXLExtractor
 
@@ -348,21 +347,14 @@ def make_env_fn(cfg: EnvConfig, rank: int):
         base_path       = "./vids_isolated/"
     )
 
-    phase_weights: dict  ={
-        "exploration":          1.0,
-        "exploration_tracking": 0.05,
-        "fire_discovery":       28.8,
-        "fire_tracking":        10.5,
-        "risk":                 1.5,
-    }
-
     def _init():
-        env = WildfireSingleAgentEnv(
+        env = SingleAgentEnv(
             world_size      = cfg.world_size,
             render_mode     = "rgb_array" if rank == 0 else "rgb_array",
             seed            = cfg.seed + rank if cfg.seed is not None else None,   # different seed per env
-            video_config    = video_config,
-            phase_weights   = phase_weights,
+            video_conf      = video_config,
+            phase_weights   = cfg.phase_weights,
+            env_id          = cfg.run_id,
             device          = torch.device("cuda:1")
         )
         return TimeLimit(env, max_episode_steps=cfg.iter_limit)

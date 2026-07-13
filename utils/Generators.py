@@ -5,6 +5,12 @@ from skimage.morphology import dilation, erosion, disk
 
 from agents.Drone import Drone
 
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.ndimage import distance_transform_edt, gaussian_filter
+from skimage.morphology import dilation, erosion, disk
+from matplotlib.colors import Normalize
+
 
 # Add poisson disk sampling, grid partitioning and rejection approach
 class PointGenerators:
@@ -263,6 +269,123 @@ class FuelMapGenerator:
         return final_mask.astype(np.uint8)
     # --- END NEW FUNCTION ---
 
+    
+
+    def generate_tree_mask_fastest_viz(
+        self,
+        shape,
+        canopy_density=0.2,
+        canopy_size_mean=5,
+        canopy_size_std=2,
+        edge_noise_strength=0.3,
+        edge_noise_scale=3,
+        merge_radius=3,
+        seed=None,
+        visualize=True
+    ):
+        """
+        Generate a tree canopy mask with optional visualization of each step.
+
+        Parameters:
+            visualize (bool): Whether to generate visualizations (images/heatmaps).
+        """
+        if seed is not None:
+            np.random.seed(seed)
+        H, W = shape
+
+        # --- Step 1: Generate tree centers (binary mask)
+        centers = np.random.rand(H, W) < canopy_density
+        if not centers.any() and visualize:
+            plt.figure(figsize=(10, 10))
+            plt.imshow(centers, cmap='gray', vmin=0, vmax=1, aspect='auto')
+            plt.title("Step 1: Tree Centers (Binary Mask)")
+            plt.colorbar()
+            plt.tight_layout()
+            plt.show()
+
+        # --- Step 2: Distance field (Euclidean distance to nearest center)
+        dist = distance_transform_edt(~centers).astype(np.float32)
+
+        if visualize:
+            plt.figure(figsize=(10, 10))
+            plt.imshow(dist, cmap='viridis', aspect='auto')
+            plt.title("Step 2: Distance Field (to Tree Centers)")
+            plt.colorbar()
+            plt.tight_layout()
+            plt.show()
+
+        # --- Step 3: Spatially varying canopy size (radius map)
+        size_noise = gaussian_filter(
+            np.random.randn(H, W).astype(np.float32),
+            sigma=5
+        )
+        size_noise = (size_noise - size_noise.min()) / (size_noise.max() - size_noise.min())
+
+        radius_map = canopy_size_mean + canopy_size_std * (size_noise - 0.5)
+        radius_map = np.clip(radius_map, 2, None)
+
+        if visualize:
+            plt.figure(figsize=(10, 10))
+            plt.imshow(radius_map, cmap='viridis', aspect='auto')
+            plt.title("Step 3: Canopy Size Map (Spatially Varying)")
+            plt.colorbar()
+            plt.tight_layout()
+            plt.show()
+
+        # --- Step 4: Field = radius_map - distance
+        field = radius_map - dist
+
+        if visualize:
+            plt.figure(figsize=(10, 10))
+            plt.imshow(field, cmap='coolwarm', aspect='auto')
+            plt.title("Step 4: Canopy Field (Radius - Distance)")
+            plt.colorbar()
+            plt.tight_layout()
+            plt.show()
+
+        # --- Step 5: Edge irregularity (add noise)
+        edge_noise = gaussian_filter(
+            np.random.randn(H, W).astype(np.float32),
+            sigma=edge_noise_scale
+        )
+        edge_noise = (edge_noise - edge_noise.min()) / (edge_noise.max() - edge_noise.min())
+
+        field += edge_noise_strength * (edge_noise - 0.5) * canopy_size_mean
+
+        if visualize:
+            plt.figure(figsize=(10, 10))
+            plt.imshow(field, cmap='inferno', aspect='auto')
+            plt.title("Step 5: Field with Edge Noise")
+            plt.colorbar()
+            plt.tight_layout()
+            plt.show()
+
+        # --- Step 6: Threshold to binary mask
+        mask = field > 0
+
+        if visualize:
+            plt.figure(figsize=(10, 10))
+            plt.imshow(mask, cmap='gray', vmin=0, vmax=1, aspect='auto')
+            plt.title("Step 6: Binary Tree Mask (Thresholded Field)")
+            plt.colorbar()
+            plt.tight_layout()
+            plt.show()
+
+        # --- Step 7: Morphological smoothing (dilation/erosion)
+        if merge_radius > 0:
+            footprint = disk(merge_radius)
+            mask = dilation(mask, footprint=footprint)
+            mask = erosion(mask, footprint=footprint)
+
+        if visualize:
+            plt.figure(figsize=(10, 10))
+            plt.imshow(mask, cmap='gray', vmin=0, vmax=1, aspect='auto')
+            plt.title("Step 7: Final Tree Mask (Morphological Smoothing)")
+            plt.colorbar()
+            plt.tight_layout()
+            plt.show()
+
+        return mask.astype(np.uint8)
 
     def generate_tree_mask_fastest(
             self,
@@ -330,10 +453,10 @@ class FuelMapGenerator:
         use_blob_generation = np.random.rand() < 0.5 # 50% chance of using the new blob generator
 
         if use_blob_generation:
-            print("--- Using Multi-Blob Fire Generation (Augmentation Mode) ---")
+            #print("--- Using Multi-Blob Fire Generation (Augmentation Mode) ---")
             fire_mask = self.generate_multi_blob_fire_field(self.size, num_blobs=8, avg_radius=25, radius_std=15, seed=seed)
         else:
-            print("--- Using Time-Series Fire Generation (Original Mode) ---")
+            #print("--- Using Time-Series Fire Generation (Original Mode) ---")
             # Original fire generation method
             fire_masks, _ = self.generate_fire_perimeter_timeseries(self.size, 
                                                                     timesteps=1, fronts_per_step=30, edge_sigma=0.5, growth_rate=0.03, wind_strength=1.0, seed=seed, num_regions=3)
