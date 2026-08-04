@@ -240,6 +240,9 @@ async def broadcast(data: dict):
 
 
 
+
+
+
 def test_random_actions_sync():
     logging.info("[test_random_actions : Enter]")
     ws_handler = WSCommsHandler.instance()
@@ -343,10 +346,7 @@ async def command_loop():
 
 
 
-async def main():
-    host = "0.0.0.0"
-    port = 8090
-
+async def start_server(host:str, port:int):
     logging.info(f"[Server] Starting on ws://{host}:{port}")
     logging.info(f"[Server] Connect UE5 to: ws://YOUR_IP:{port}")
     logging.info(f"[Server] Type commands to send to UE5 clients")
@@ -366,13 +366,28 @@ async def main():
     ):
         await asyncio.gather(
             asyncio.Future(),   # keep server running
-            dispatch_loop(),      # read stdin commands
+            dispatch_loop(),    # flush queue and dispatch msgs
         )
 
+
+async def start_eval_server(host:str, port:int):
+    logging.info(f"[Server] Starting evaluation server on ws://{host}:{port}")
+    logging.info(f"[Server] Connect UE5 to: ws://YOUR_IP:{port}")
+
+    async with websockets.serve(
+        handle_client,
+        host,
+        port,
+        max_size=50 * 1024 * 1024
+    ):
+        await asyncio.gather(
+            asyncio.Future(),   # keep server running
+            dispatch_loop(),    # flush queue and dispatch msgs
+        )
 
 if __name__ == "__main__":
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
     )
-    asyncio.run(main())
+    asyncio.run(start_server("0.0.0.0", 8090))

@@ -448,9 +448,9 @@ class FuelMapGenerator:
 
         return mask.astype(np.uint8)
     
-    def create_map(self, canopy_density_alive, canopy_density_dead, canopy_size_mean=8, merge_radius=3, seed=None):
+    def create_map(self, canopy_density_alive, canopy_density_dead, canopy_size_mean=8, merge_radius=3, seed=None, selection_frac=0.5):
         # Determine which fire generation method to use (random switch for augmentation)
-        use_blob_generation = np.random.rand() < 0.5 # 50% chance of using the new blob generator
+        use_blob_generation = np.random.rand() < selection_frac # 50% chance of using the new blob generator
 
         if use_blob_generation:
             #print("--- Using Multi-Blob Fire Generation (Augmentation Mode) ---")
@@ -822,3 +822,434 @@ class FireClusterMapGenerator:
         ], dtype=np.float32)
         arr = (arr - arr.min()) / (arr.max() - arr.min() + 1e-8)
         return arr
+
+
+
+
+
+
+from scipy.ndimage import gaussian_filter
+
+
+class FuelMapGeneratorEval:
+
+    def __init__(self, size):
+        self.size = size
+
+    # -------------------------------------------------------------------------
+    # Deterministic fire blob
+    # -------------------------------------------------------------------------
+
+    def generate_fixed_blob(
+        self,
+        shape,
+        center,
+        radius=25,
+        edge_sigma=2.0,
+        threshold=0.4
+    ):
+        """
+        Generate a single deterministic circular fire blob.
+
+        Parameters
+        ----------
+        shape : tuple
+            (H, W)
+
+        center : tuple
+            (y, x)
+
+        radius : float
+            Radius of the fire blob.
+
+        edge_sigma : float
+            Gaussian smoothing applied to the blob.
+
+        threshold : float
+            Threshold used to obtain the final binary fire mask.
+        """
+
+        H, W = shape
+        cy, cx = center
+
+        y, x = np.ogrid[:H, :W]
+
+        distance = np.sqrt(
+            (x - cx) ** 2 +
+            (y - cy) ** 2
+        )
+
+        # Smooth radial blob
+        blob = np.exp(
+            -(distance ** 2) /
+            (2 * radius ** 2)
+        )
+
+        if edge_sigma > 0:
+            blob = gaussian_filter(blob, sigma=edge_sigma)
+
+        blob = blob / (blob.max() + 1e-8)
+
+        return (blob > threshold).astype(np.uint8)
+
+    # -------------------------------------------------------------------------
+    # Generate polygon vertices
+    # -------------------------------------------------------------------------
+
+    def generate_polygon_centers(
+        self,
+        shape,
+        num_vertices,
+        side_length,
+        center=None,
+        rotation=0.0
+    ):
+        """
+        Generate equally spaced vertices of a regular polygon.
+
+        Important:
+        ----------
+        side_length is the distance between adjacent polygon vertices.
+
+        For a regular polygon with N vertices:
+
+            circumradius =
+                side_length /
+                (2 * sin(pi / N))
+
+        Returns
+        -------
+        centers : list of (y, x)
+        """
+
+        H, W = shape
+
+        if center is None:
+            center_y = H / 2
+            center_x = W / 2
+        else:
+            center_y, center_x = center
+
+        # Convert polygon side length into circumradius
+        circumradius = side_length / (
+            2 * np.sin(np.pi / num_vertices)
+        )
+
+        centers = []
+
+        for i in range(num_vertices):
+
+            angle = (
+                rotation +
+                2 * np.pi * i / num_vertices
+            )
+
+            y = center_y + circumradius * np.sin(angle)
+            x = center_x + circumradius * np.cos(angle)
+
+            # Keep vertices inside map
+            y = int(np.clip(y, 0, H - 1))
+            x = int(np.clip(x, 0, W - 1))
+
+            centers.append((y, x))
+
+        return centers
+
+    # -------------------------------------------------------------------------
+    # Fire blobs arranged as a regular polygon
+    # -------------------------------------------------------------------------
+
+    def generate_polygon_fire(
+        self,
+        shape,
+        num_vertices,
+        side_length,
+        blob_radius=25,
+        center=None,
+        rotation=0.0,
+        edge_sigma=2.0,
+        threshold=0.4
+    ):
+        """
+        Generate fire blobs positioned at the vertices of a regular polygon.
+
+        Examples
+        --------
+        num_vertices=3 -> triangle
+        num_vertices=4 -> square
+        num_vertices=5 -> pentagon
+        """
+
+        centers = self.generate_polygon_centers(
+            shape=shape,
+            num_vertices=num_vertices,
+            side_length=side_length,
+            center=center,
+            rotation=rotation
+        )
+
+        fire = np.zeros(shape, dtype=np.float32)
+
+        for center in centers:
+
+            blob = self.generate_fixed_blob(
+                shape=shape,
+                center=center,
+                radius=blob_radius,
+                edge_sigma=edge_sigma,
+                threshold=threshold
+            )
+
+            fire = np.maximum(fire, blob)
+
+        return fire.astype(np.uint8), centers
+
+    # -------------------------------------------------------------------------
+    # Two separated fire blobs
+    # -------------------------------------------------------------------------
+
+    def generate_two_blob_fire(
+        self,
+        shape,
+        spacing,
+        blob_radius=25,
+        center=None,
+        angle=0.0,
+        edge_sigma=2.0,
+        threshold=0.4
+    ):
+        """
+        Generate exactly two fire blobs separated by a fixed center-to-center
+        distance.
+
+        Parameters
+        ----------
+        spacing : float
+            Distance between the centers of the two blobs.
+
+        angle : float
+            Orientation of the pair in radians.
+        """
+
+        H, W = shape
+
+        if center is None:
+            center_y = H / 2
+            center_x = W / 2
+        else:
+            center_y, center_x = center
+
+        half_spacing = spacing / 2
+
+        dy = half_spacing * np.sin(angle)
+        dx = half_spacing * np.cos(angle)
+
+        center_1 = (
+            int(np.clip(center_y - dy, 0, H - 1)),
+            int(np.clip(center_x - dx, 0, W - 1))
+        )
+
+        center_2 = (
+            int(np.clip(center_y + dy, 0, H - 1)),
+            int(np.clip(center_x + dx, 0, W - 1))
+        )
+
+        fire_1 = self.generate_fixed_blob(
+            shape=shape,
+            center=center_1,
+            radius=blob_radius,
+            edge_sigma=edge_sigma,
+            threshold=threshold
+        )
+
+        fire_2 = self.generate_fixed_blob(
+            shape=shape,
+            center=center_2,
+            radius=blob_radius,
+            edge_sigma=edge_sigma,
+            threshold=threshold
+        )
+
+        fire = np.maximum(fire_1, fire_2)
+
+        return fire.astype(np.uint8), [center_1, center_2]
+
+    # -------------------------------------------------------------------------
+    # Main deterministic evaluation map generator
+    # -------------------------------------------------------------------------
+
+    def create_eval_map(
+        self,
+        map_id,
+        canopy_density_alive=0.2,
+        canopy_density_dead=0.1,
+        canopy_size_mean=8,
+        merge_radius=3,
+
+        # Fire parameters
+        blob_radius=25,
+        side_length=150,
+        blob_spacing=200,
+
+        # Polygon parameters
+        polygon_center=None,
+        polygon_rotation=0.0,
+
+        # Two-blob parameters
+        two_blob_center=None,
+        two_blob_angle=0.0,
+
+        seed=1234
+    ):
+        """
+        Generate deterministic evaluation maps.
+
+        map_id
+        ------
+        0 : Triangle
+        1 : Square
+        2 : Pentagon
+        3 : Two separated blobs
+
+        Returns
+        -------
+        world_map : np.ndarray
+            Shape: (H, W, 2)
+
+            world_map[:, :, 0] = fuel
+            world_map[:, :, 1] = fire
+
+        metadata : dict
+            Contains fire blob centers and map information.
+        """
+
+        H, W = self.size
+
+        # ================================================================
+        # Deterministic fuel map
+        # ================================================================
+
+        # Use separate deterministic seeds for alive and dead vegetation.
+        #
+        # This avoids both masks being identical when the same seed is used.
+        tree_mask_alive = self.generate_tree_mask_fastest(
+            shape=self.size,
+            canopy_density=canopy_density_alive,
+            canopy_size_mean=canopy_size_mean,
+            merge_radius=merge_radius,
+            edge_noise_scale=2,
+            seed=seed
+        )
+
+        tree_mask_dead = self.generate_tree_mask_fastest(
+            shape=self.size,
+            canopy_density=canopy_density_dead,
+            canopy_size_mean=canopy_size_mean,
+            merge_radius=merge_radius,
+            edge_noise_scale=2,
+            seed=seed + 1
+        )
+
+        w = 0.7
+
+        forest_fuel_map = (
+            w * tree_mask_alive +
+            (1 - w) * tree_mask_dead
+        )
+
+        # ================================================================
+        # Deterministic fire map
+        # ================================================================
+
+        if map_id == 0:
+
+            # Triangle
+            fire_mask, fire_centers = self.generate_polygon_fire(
+                shape=self.size,
+                num_vertices=3,
+                side_length=side_length,
+                blob_radius=blob_radius,
+                center=polygon_center,
+                rotation=polygon_rotation
+            )
+
+            map_name = "triangle"
+
+        elif map_id == 1:
+
+            # Square
+            fire_mask, fire_centers = self.generate_polygon_fire(
+                shape=self.size,
+                num_vertices=4,
+                side_length=side_length,
+                blob_radius=blob_radius,
+                center=polygon_center,
+                rotation=polygon_rotation
+            )
+
+            map_name = "square"
+
+        elif map_id == 2:
+
+            # Pentagon
+            fire_mask, fire_centers = self.generate_polygon_fire(
+                shape=self.size,
+                num_vertices=5,
+                side_length=side_length,
+                blob_radius=blob_radius,
+                center=polygon_center,
+                rotation=polygon_rotation
+            )
+
+            map_name = "pentagon"
+
+        elif map_id == 3:
+
+            # Two separated blobs
+            fire_mask, fire_centers = self.generate_two_blob_fire(
+                shape=self.size,
+                spacing=blob_spacing,
+                blob_radius=blob_radius,
+                center=two_blob_center,
+                angle=two_blob_angle
+            )
+
+            map_name = "two_blobs"
+
+        else:
+            raise ValueError(
+                f"Unknown map_id={map_id}. "
+                f"Available map IDs: 0, 1, 2, 3."
+            )
+
+        # ================================================================
+        # Construct world map
+        # ================================================================
+
+        world_map = np.zeros(
+            (H, W, 2),
+            dtype=np.float32
+        )
+
+        world_map[:, :, 0] = forest_fuel_map
+        world_map[:, :, 1] = fire_mask
+
+        # Fixed wind for evaluation
+        # You can change this depending on whether wind is part of the
+        # observation or dynamics.
+        wind_field = (
+            1.0,
+            0.0,
+            1.0
+        )
+
+        metadata = {
+            "map_id": map_id,
+            "map_name": map_name,
+            "fire_centers": fire_centers,
+            "blob_radius": blob_radius,
+            "side_length": side_length,
+            "blob_spacing": blob_spacing
+        }
+
+        return world_map, wind_field, metadata

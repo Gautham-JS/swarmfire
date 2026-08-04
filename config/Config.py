@@ -15,14 +15,16 @@ class VideoWriterConfig:
 
 @dataclass
 class EnvConfig:
-    run_id:           str   = None
+    run_id:           str   = "WIldfireRL"
 
     # Environment
     world_size:       tuple = (512, 512)
     n_agents:         int   = 1
-    iter_limit:       int   = 1028
-    seed:             int   = None
-    n_envs:           int   = 8          # parallel environments
+    iter_limit:       int   = 512 * 2
+    seed:             int   = 256
+    n_envs:           int   = 16          # parallel environments
+    vp_size:          int   = 64          # viewport size
+    disable_recency_obs: bool = False      # disable recency observation channel
 
     # TrXL
     features_dim:     int   = 256
@@ -33,32 +35,33 @@ class EnvConfig:
     dropout:          float = 0.1
 
     # PPO
-    total_timesteps:  int   = 2_000_000
+    total_timesteps:  int   = 4_000_000
     n_steps:          int   = 512        # steps per env per rollout
                                          # total transitions = n_steps * n_envs. 
-    batch_size:       int   = 256        # minibatch size for PPO update
-    n_epochs:         int   = 10
+    batch_size:       int   = 1024        # minibatch size for PPO update
+    n_epochs:         int   = 5
     learning_rate:    float = 1e-4
     gamma:            float = 0.99
     gae_lambda:       float = 0.95
     clip_coef:        float = 0.2
     ent_coef:         float = 0.0001
-    vf_coef:          float = 0.5
+    vf_coef:          float = 0.25
     max_grad_norm:    float = 0.3
-    target_kl:        float = 0.03
+    target_kl:        float = 0.07
 
     # Env weights
     phase_weights:    dict  = field(default_factory=lambda: {
         "exploration":          1.0,
         "exploration_tracking": 0.05,
-        "fire_discovery":       18.8,
-        "fire_tracking":        10.5,
+        "fire_discovery":       1.6,
+        "fire_tracking":        0.5,
         "risk":                 1.5,
+        "recency_pen":          2,
     })
 
     # Checkpointing
     checkpoint_freq:  int   = 50_000
-    checkpoint_dir:   str   = "./checkpoints"
+    checkpoint_dir:   str   = "./checkpoints_gtrxlh"
     best_model_dir:   str   = "./best_model"
 
     # Evaluation

@@ -8,6 +8,30 @@ Key changes from single-env version:
   4. Episode done handling resets only the finished env's memory slice.
   5. GAE is computed across the (n_steps, N) transition grid.
   6. Minibatch indexing uses flat (step * N + env) indices.
+
+# --- NEW: memory diagnostics ---
+  7. Every DIAGNOSTICS_FREQ rollouts, run_full_diagnostics() computes and
+     logs recency profile / attention entropy / head specialization / CKA
+     to wandb (see the "MEMORY DIAGNOSTICS" markers below for the two
+     insertion points).
+
+# --- BUGFIX pass ---
+  8. Eval no longer wipes the live training memory. evaluate() runs on a
+     separate single-env instance but was mutating agent.extractor.memory /
+     _segment_hiddens directly (setting them to None, then back to None).
+     train() used to follow every eval with init_memory(batch_size=n_envs, ...),
+     which re-created the memory tensors at the right shape but filled with
+     ZEROS — silently wiping out everything the n_envs training rollouts had
+     accumulated, every single eval_freq steps. Fixed by snapshotting memory
+     before evaluate() and restoring it after, instead of reinitialising.
+  9. PPO KL early-stopping previously accumulated kl_divs across ALL epochs
+     without resetting between them, so the "mean KL so far" check after
+     epoch N was diluted by earlier (typically smaller) epochs' KL values —
+     making early-stop trigger later, and after more overshoot, than the
+     value logged implied. Fixed by tracking KL per-epoch (reset each epoch)
+     for the epoch-level stop check, plus an added per-minibatch hard guard
+     so a runaway update inside a single epoch doesn't have to wait for the
+     epoch to finish before stopping.
 """
 
 import os
@@ -33,6 +57,7 @@ from config.Config import VideoWriterConfig, EnvConfig
 from policies.TrXL import TrXLExtractor
 
 import logging
+from policies.trxl_memory_diagnostics import run_full_diagnostics
 
 
 logging.basicConfig(
@@ -333,7 +358,7 @@ def single_obs_to_tensor(obs_dict, device):
 # Environment factory
 # 
 
-def make_env_fn(cfg: EnvConfig, rank: int):
+def make_env_fn(cfg: EnvConfig, rank: int, is_eval: bool = False):
     """
     Returns a thunk (zero-argument function) that creates one environment.
     SubprocVecEnv calls these thunks in separate processes.
@@ -341,7 +366,7 @@ def make_env_fn(cfg: EnvConfig, rank: int):
     Only rank=0 renders and saves videos — all others run silently for speed.
     """
     video_config = VideoWriterConfig(
-        is_enabled      = rank == 0,
+        is_enabled      = rank == 0 ,
         sample_interval = 10      if rank == 0 else 999999,
         save_interval   = 10      if rank == 0 else 999999,
         base_path       = "./vids_isolated/"
@@ -355,6 +380,9 @@ def make_env_fn(cfg: EnvConfig, rank: int):
             video_conf      = video_config,
             phase_weights   = cfg.phase_weights,
             env_id          = cfg.run_id,
+            vp_size         = cfg.vp_size,
+            is_gt_visible   = True,
+            is_recency_obs_disabled=True,
             device          = torch.device("cuda:1")
         )
         return TimeLimit(env, max_episode_steps=cfg.iter_limit)
@@ -494,6 +522,14 @@ def train(cfg: EnvConfig, checkpoint_path=None):
     SCATTER_EP_FREQ = 50
     episode_count   = 0
 
+    # --- NEW: memory diagnostics --------------------------------------------
+    # Runs recency profile / attention entropy / head specialization / CKA
+    # every DIAGNOSTICS_FREQ rollouts (not every rollout -- it's a few extra
+    # forward passes, including the CKA memory-ablation counterfactual).
+    DIAGNOSTICS_FREQ = 1
+    rollout_count    = 0
+    # -------------------------------------------------------------------------
+
     agent.extractor.init_memory(batch_size=cfg.n_envs, device=device)
 
     logging.info(f"[TRAIN] Starting - {cfg.total_timesteps:,} steps | "
@@ -549,17 +585,20 @@ def train(cfg: EnvConfig, checkpoint_path=None):
 
                 info           = infos[env_idx]
                 domain_metrics = info.get("domain_metrics", {})
-                filtered_domain_metrics = {
-                    k: v for k, v in domain_metrics.items() if v != cfg.iter_limit
-                }
 
                 wandb.log({
-                    "episode/reward":      float(ep_rewards[env_idx]),
-                    "episode/length":      int(ep_lengths[env_idx]),
-                    "episode/mean_reward": mean_reward,
-                    "episode/env_idx":     env_idx,
-                    "global_step":         global_step,
-                    # **filtered_domain_metrics,
+                    "episode/reward":                 float(ep_rewards[env_idx]),
+                    "episode/length":                 int(ep_lengths[env_idx]),
+                    "episode/mean_reward":            mean_reward,
+                    "episode/env_idx":                env_idx,
+                    "domain/fire_revisit_count":     domain_metrics.get("domain/revisit_count", 0),
+                    "domain/fire_revisit_mean_delta": domain_metrics.get("domain/revisit_delta_mean", 0.0),
+                    "domain/fire_revisit_max_delta": domain_metrics.get("domain/revisit_delta_max", 0.0),
+                    "domain/fire_revisit_min_delta": domain_metrics.get("domain/revisit_delta_min", 0.0),
+                    "domain/fire_coverage_mean":     domain_metrics.get("domain/fire_coverage_mean", 0.0),
+                    "domain/fire_coverage_AUC":       domain_metrics.get("domain/fire_coverage_AUC", 0.0),
+                    "domain/fire_coverage_final":     domain_metrics.get("domain/fire_coverage_final", 0.0),
+                    "global_step":                    global_step,
                 })
 
                 # Scatter 1: episode length vs reward 
@@ -582,7 +621,7 @@ def train(cfg: EnvConfig, checkpoint_path=None):
                         "global_step": global_step,
                     })
                     scatter_ep_data = []   # flush prevents the table growing unboundedly
-                
+
                 # Scatter 2: fire coverage progression (steps to reach each threshold) 
                 # Each episode contributes one curve: [threshold, steps_to_reach]
                 # -1 means the agent never reached that threshold skip those points
@@ -611,6 +650,20 @@ def train(cfg: EnvConfig, checkpoint_path=None):
                 ep_rewards[env_idx] = 0.0
                 ep_lengths[env_idx] = 0
 
+        # --- NEW: memory diagnostics --------------------------------------------
+        # Placed here deliberately: rollout collection has just finished, agent
+        # is still in .eval() mode, agent.extractor.memory reflects the live
+        # state from the rollout just collected, and obs_dict is the freshest
+        # observation available. Must run BEFORE the PPO update loop detaches
+        # and mutates agent.extractor.memory further down.
+        rollout_count += 1
+        if rollout_count % DIAGNOSTICS_FREQ == 0:
+            logging.info(f"[DIAGNOSTICS] Running memory diagnostics at rollout {rollout_count}")
+            diag_obs_t = vec_obs_to_tensor(obs_dict, device)
+            diag_log   = run_full_diagnostics(agent, diag_obs_t, device, memory_len=cfg.memory_len)
+            wandb.log({**diag_log, "global_step": global_step})
+        # -------------------------------------------------------------------------
+
         # Compute GAE 
         with torch.no_grad():
             obs_t       = vec_obs_to_tensor(obs_dict, device)
@@ -627,6 +680,11 @@ def train(cfg: EnvConfig, checkpoint_path=None):
         for epoch in range(cfg.n_epochs):
             if stop_early:
                 break
+
+            # FIX: track this epoch's KLs separately so the epoch-level
+            # early-stop check reflects THIS epoch's drift, not a running
+            # average diluted by earlier (typically smaller-KL) epochs.
+            epoch_kls = []
 
             for (obs_b, actions_b, old_log_probs_b,
                  advantages_b, returns_b, old_values_b,
@@ -668,13 +726,26 @@ def train(cfg: EnvConfig, checkpoint_path=None):
                 value_losses.append(vl)
                 entropies.append(ent)
                 kl_divs.append(approx_kl)
+                epoch_kls.append(approx_kl)
 
                 # Scatter accumulators (per minibatch) 
                 scatter_loss_data.append([pl, vl])
                 scatter_kl_data.append([approx_kl, ent])
 
-            if kl_divs and np.mean(kl_divs) > cfg.target_kl:
-                logging.info(f"[PPO] Early stop at epoch {epoch+1}, KL={np.mean(kl_divs):.4f}")
+                # FIX: hard per-minibatch guard so a single runaway update
+                # doesn't have to wait for the rest of the epoch to finish
+                # before we stop. Threshold is intentionally looser than
+                # target_kl (this is a safety rail, not the primary check).
+                if approx_kl > cfg.target_kl * 1.5:
+                    logging.info(
+                        f"[PPO] Early stop mid-epoch {epoch+1}, "
+                        f"minibatch KL={approx_kl:.4f} (> {cfg.target_kl * 1.5:.4f})"
+                    )
+                    stop_early = True
+                    break
+
+            if not stop_early and epoch_kls and np.mean(epoch_kls) > cfg.target_kl:
+                logging.info(f"[PPO] Early stop at epoch {epoch+1}, KL={np.mean(epoch_kls):.4f}")
                 stop_early = True
 
         # Detach memory 
@@ -725,7 +796,7 @@ def train(cfg: EnvConfig, checkpoint_path=None):
 
         # ── Checkpoint ────────────────────────────────────────────────────────
         if global_step >= next_ckpt_step:
-            ckpt_path = os.path.join(cfg.checkpoint_dir, f"firescout_{global_step}_steps.pt")
+            ckpt_path = os.path.join(cfg.checkpoint_dir, f"firescout_ext_{global_step}_steps.pt")
             torch.save({
                 "agent":            agent.state_dict(),
                 "optimizer":        optimizer.state_dict(),
@@ -743,6 +814,23 @@ def train(cfg: EnvConfig, checkpoint_path=None):
 
         # ── Evaluation ────────────────────────────────────────────────────────
         if global_step >= next_eval_step:
+            # FIX: snapshot the LIVE training memory before evaluate() runs.
+            # evaluate() operates on a separate single-env instance but
+            # mutates agent.extractor.memory / _segment_hiddens directly
+            # (sets them to None at start and end). Previously this was
+            # followed by init_memory(batch_size=cfg.n_envs, ...), which
+            # got the shape right again but filled with ZEROS -- silently
+            # wiping every training env's accumulated memory each eval_freq
+            # steps. Restoring the snapshot instead preserves content.
+            saved_memory = (
+                [m.clone() for m in agent.extractor.memory]
+                if agent.extractor.memory is not None else None
+            )
+            saved_segment_hiddens = (
+                [h.clone() for h in agent.extractor._segment_hiddens]
+                if agent.extractor._segment_hiddens is not None else None
+            )
+
             eval_reward = evaluate(agent, cfg, device, cfg.n_eval_episodes)
             logging.info(f"[EVAL] step={global_step} mean_reward={eval_reward:.3f}")
             wandb.log({"eval/mean_reward": eval_reward, "global_step": global_step})
@@ -757,7 +845,15 @@ def train(cfg: EnvConfig, checkpoint_path=None):
                 }, os.path.join(cfg.best_model_dir, "best_model.pt"))
                 logging.info(f"[EVAL] New best : {best_eval_reward:.3f}")
 
-            agent.extractor.init_memory(batch_size=cfg.n_envs, device=device)
+            # Restore rather than reinit -- see fix note above. Fall back to
+            # init_memory only in the (practically unreachable, since it's
+            # already called before the main loop starts) case where no
+            # snapshot existed yet.
+            if saved_memory is not None:
+                agent.extractor.memory = saved_memory
+                agent.extractor._segment_hiddens = saved_segment_hiddens
+            else:
+                agent.extractor.init_memory(batch_size=cfg.n_envs, device=device)
             next_eval_step += cfg.eval_freq
 
     # ── End ───────────────────────────────────────────────────────────────────
@@ -770,4 +866,3 @@ def train(cfg: EnvConfig, checkpoint_path=None):
     logging.info("[DONE] Training complete.")
     wandb.finish()
     envs.close()
-
