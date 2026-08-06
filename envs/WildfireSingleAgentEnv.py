@@ -1065,11 +1065,13 @@ class SingleAgentEnv(gym.Env):
         else:
             logging.info("Running in UE5 mode, creating UE5 websocket client")
             self.agent_instance = UE5Agent("agent_0", self.world_size, start_pos=self.start_poss, seed=self.seed, vp_size=self.vp_size)
-        state:AgentState = self.agent_instance.step([1, 1], step_id=0)
-
+        state:AgentState = self.agent_instance.step([1, 1], step_id=-1)
 
         # Seed pos_history so _build_positions_obs has something to diff on step 1
-        self._positions_history.append(self.start_poss)
+        if self.is_ue5_mode:
+            self._positions_history.append((state.pos_x, state.pos_y))
+        else:
+            self._positions_history.append(self.start_poss)
 
         obs = {
             "viewport":  self.create_global_crop_viewport_obs(state),

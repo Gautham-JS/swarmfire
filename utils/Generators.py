@@ -8,6 +8,7 @@ from agents.Drone import Drone
 import numpy as np
 import matplotlib.pyplot as plt
 from scipy.ndimage import distance_transform_edt, gaussian_filter
+from skimage.transform import resize
 from skimage.morphology import dilation, erosion, disk
 from matplotlib.colors import Normalize
 
@@ -77,8 +78,10 @@ from skimage.morphology import dilation, disk, erosion # Added erosion for consi
 
 
 class FuelMapGenerator:
-    def __init__(self, size):
+    def __init__(self, size, randomize_scales=True, size_range=(256, 2048)):
         self.size = size
+        self._is_randomize_scales = randomize_scales
+        self._size_range = size_range
         # Assuming FireClusterMapGenerator is defined elsewhere and used here
         # self.fire_gen = FireClusterMapGenerator(self.size) 
 
@@ -449,22 +452,25 @@ class FuelMapGenerator:
         return mask.astype(np.uint8)
     
     def create_map(self, canopy_density_alive, canopy_density_dead, canopy_size_mean=8, merge_radius=3, seed=None, selection_frac=0.5):
-        # Determine which fire generation method to use (random switch for augmentation)
         use_blob_generation = np.random.rand() < selection_frac # 50% chance of using the new blob generator
+
+        gen_size = self.size
+        if self._is_randomize_scales:
+            r_scale = np.random.uniform(self._size_range[0], self._size_range[1])
+            gen_size = (int(r_scale), int(r_scale))
 
         if use_blob_generation:
             #print("--- Using Multi-Blob Fire Generation (Augmentation Mode) ---")
-            fire_mask = self.generate_multi_blob_fire_field(self.size, num_blobs=8, avg_radius=25, radius_std=15, seed=seed)
+            fire_mask = self.generate_multi_blob_fire_field(gen_size, num_blobs=8, avg_radius=25, radius_std=15, seed=seed)
         else:
             #print("--- Using Time-Series Fire Generation (Original Mode) ---")
             # Original fire generation method
-            fire_masks, _ = self.generate_fire_perimeter_timeseries(self.size, 
-                                                                    timesteps=1, fronts_per_step=30, edge_sigma=0.5, growth_rate=0.03, wind_strength=1.0, seed=seed, num_regions=3)
+            fire_masks, _ = self.generate_fire_perimeter_timeseries(gen_size, timesteps=1, fronts_per_step=30, edge_sigma=0.5, growth_rate=0.03, wind_strength=1.0, seed=seed, num_regions=3)
             fire_mask = fire_masks[0]
 
 
         tree_mask_base = self.generate_tree_mask_fastest(
-            self.size,
+            gen_size,
             canopy_density=canopy_density_alive,
             canopy_size_mean=8,
             merge_radius=3,      
@@ -474,7 +480,7 @@ class FuelMapGenerator:
 
 
         tree_mask_dead = self.generate_tree_mask_fastest(
-            self.size,
+            gen_size,
             canopy_density=canopy_density_dead,
             canopy_size_mean=8,
             merge_radius=3,      
@@ -482,7 +488,7 @@ class FuelMapGenerator:
             seed=seed
         )
 
-        world_map = np.zeros((self.size[0], self.size[0], 2), dtype=np.float32)
+        world_map = np.zeros((gen_size[0], gen_size[0], 2), dtype=np.float32)
 
         # wind field generation remains the same
         wind_field = self.generate_wind_field(self.size, seed=seed)
@@ -492,6 +498,8 @@ class FuelMapGenerator:
         world_map[:, :, 0] = forest_fuel_map
         world_map[:, :, 1] = fire_mask
 
+        if self._is_randomize_scales:
+            world_map = resize(world_map, (self.size[0], self.size[1], 2), anti_aliasing=True, mode='reflect', preserve_range=True).astype(np.float32)
 
         return world_map, wind_field
     

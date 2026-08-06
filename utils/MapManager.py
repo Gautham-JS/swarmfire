@@ -395,13 +395,14 @@ class MapManagerSingleton(type):
         return cls._instances[cls] 
 
 class BaseMapManager:
-    def __init__(self, world_size, vp_size, seed=None, is_recency_enabled=True, is_eval_mode=False):
+    def __init__(self, world_size, vp_size, seed=None, is_recency_enabled=True, is_eval_mode=False, randomized_scale=True):
         self._world_size = world_size
         self._seed = seed
         self._is_recency_enabled = is_recency_enabled
         self._is_eval_mode = is_eval_mode
         self._vp_size = vp_size
         self._wind_vector: tuple[float, float, float] = None    # [x comp, y comp, magnitude]
+        self._is_randomized_scale = randomized_scale
 
         self._step_id = 0
 
@@ -507,8 +508,8 @@ class BaseMapManager:
 
 class SimulatedMapManager(BaseMapManager, metaclass=MapManagerSingleton):
 
-    def __init__(self, world_size, vp_size, seed=None, is_recency_enabled=True, is_eval_mode=False):
-        super().__init__(world_size, vp_size, seed, is_recency_enabled, is_eval_mode=is_eval_mode)
+    def __init__(self, world_size, vp_size, seed=None, is_recency_enabled=True, is_eval_mode=False, randomized_scale=True):
+        super().__init__(world_size, vp_size, seed, is_recency_enabled, is_eval_mode=is_eval_mode, randomized_scale=randomized_scale)
         
         if self._is_eval_mode:
             self._generator = Generators.FuelMapGeneratorEval(world_size)
@@ -645,8 +646,8 @@ class UE5MapManager(BaseMapManager, metaclass=MapManagerSingleton):
     the inbound side, since the UE5 C++ side itself reports position as a
     raw, unflipped offset from the volume's min corner.
     """
-    def __init__(self, world_size, vp_size, seed=None, is_recency_enabled=True, is_eval_mode=False):
-        super().__init__(world_size, vp_size, seed, is_recency_enabled, is_eval_mode=is_eval_mode)
+    def __init__(self, world_size, vp_size, seed=None, is_recency_enabled=True, is_eval_mode=False, randomized_scale=True):
+        super().__init__(world_size, vp_size, seed, is_recency_enabled, is_eval_mode=is_eval_mode, randomized_scale=randomized_scale)
         self.comms_handler : WSCommsHandler = WSCommsHandler.instance()
         self.last_step_id = -1
         self.last_response = None

@@ -14,6 +14,13 @@ class VideoWriterConfig:
 
 
 @dataclass
+class AgentConfig:
+    max_speed           : float         = 50.0
+    damping_factor      : float         = 0.9
+    rand_speed_range    : tuple         = (20.0, 100.0)
+    rand_damping_range  : tuple         = (0.5, 1.0)
+
+@dataclass
 class EnvConfig:
     run_id:           str   = "WIldfireRL"
 
