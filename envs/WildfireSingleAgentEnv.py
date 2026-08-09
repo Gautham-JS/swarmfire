@@ -1539,14 +1539,16 @@ class SingleAgentEnv(gym.Env):
         last_pos = self._positions_history[-1] if len(self._positions_history) > 0 else self.start_poss
         px, py = last_pos[0], last_pos[1]
         # Normalised position
-        obs.append(px / self.world_size[0])
-        obs.append(py / self.world_size[1])
+        norm_px, norm_py = px / self.world_size[0], py / self.world_size[1]
+        obs.append(norm_px)
+        obs.append(norm_py)
 
         # Velocity (from last step)
-        if len(self._positions_history) >= 2:
-            prev = self._positions_history[-2]
-            vx = (px - prev[0]) / (self.step_size + 1e-8)
-            vy = (py - prev[1]) / (self.step_size + 1e-8)
+        if len(self._observation_history) >= 2:
+            prev_obs = self._observation_history[-2]
+            prev_pos = prev_obs["positions"]
+            vx = (norm_px - prev_pos[0]) / (self.step_size + 1e-8)
+            vy = (norm_py - prev_pos[1]) / (self.step_size + 1e-8)
         else:
             vx, vy = 0.0, 0.0
         obs.append(np.clip(vx, -1, 1))
@@ -1574,12 +1576,14 @@ class SingleAgentEnv(gym.Env):
         obs["viewport"] = self.create_global_crop_viewport_obs(state)
         obs["positions"] = self._build_positions_obs()
 
+        logging.info(f"[STEP] -> obs_positions = {obs['positions']}")
+
         self._positions_history.append((state.pos_x, state.pos_y))
         self._reward_history.append(reward)
         self._observation_history.append(obs)
         if not self.is_ue5_mode:
             self._fire_coverage_history.append(self.get_fire_coverage_percentage())
-        self._step_count+=1
+        self._step_count += 1
 
         infos["domain_metrics"] = self.log_metrics()
 
