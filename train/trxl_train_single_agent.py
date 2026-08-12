@@ -121,7 +121,7 @@ class TrXLActorCritic(nn.Module):
             d_ff_multiplier = cfg.d_ff_multiplier,
             dropout         = cfg.dropout,
             use_gating      = cfg.is_gating,
-            use_hyperconnect= cfg.is_hyperconnect,
+            use_hyperconnections= cfg.is_hyperconnect,
             use_spatial_bias= cfg.is_spatial_bias
         )
 
