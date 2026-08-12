@@ -11,7 +11,6 @@ from scipy.ndimage import distance_transform_edt, gaussian_filter
 from skimage.transform import resize
 from skimage.morphology import dilation, erosion, disk
 from matplotlib.colors import Normalize
-import logging
 
 
 # Add poisson disk sampling, grid partitioning and rejection approach
@@ -459,7 +458,6 @@ class FuelMapGenerator:
         if self._is_randomize_scales:
             r_scale = np.random.uniform(self._size_range[0], self._size_range[1])
             gen_size = (int(r_scale), int(r_scale))
-            #logging.info(f"Randomized generation size: {gen_size}")
 
         if use_blob_generation:
             #print("--- Using Multi-Blob Fire Generation (Augmentation Mode) ---")

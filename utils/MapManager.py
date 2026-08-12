@@ -345,7 +345,7 @@ class UE5Agent(BaseAgent):
         ax, ay = int(action[0]), int(action[1])
         ue5_ax = ax
         ue5_ay = 2 - ay
-        return [ue5_ax, ay]
+        return [ue5_ax, ue5_ay]
 
     def step(self, action, step_id):
         # Forward the discrete action to UE5 using ITS convention (literal
@@ -528,7 +528,7 @@ class SimulatedMapManager(BaseMapManager, metaclass=MapManagerSingleton):
         if self._is_eval_mode:
             self._map, self._wind_vector = self._generator.create_eval_map(2, 0.001, 0.003, seed=self._seed)
         else:
-            self._map, self._wind_vector = self._generator.create_map(0.001, 0.003, seed=self._seed, selection_frac=0.6)
+            self._map, self._wind_vector = self._generator.create_map(0.001, 0.003, seed=self._seed, selection_frac=0.9)
 
     def extract_view_and_deltas_update(self, agent_state: AgentState):
         x, y = agent_state.pos_x, agent_state.pos_y
@@ -705,8 +705,7 @@ class UE5MapManager(BaseMapManager, metaclass=MapManagerSingleton):
         """
         scale_x, scale_y = self.compute_scaling_fac((ue5_w, ue5_h))
 
-        # flipped_y_ue5 = ue5_h - y_ue5
-        flipped_y_ue5 = y_ue5
+        flipped_y_ue5 = ue5_h - y_ue5
 
         px = x_ue5 * scale_x
         py = flipped_y_ue5 * scale_y
