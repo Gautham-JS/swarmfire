@@ -233,7 +233,7 @@ def make_eval_env(
     video_config = VideoWriterConfig(
 
         # Enable video recording during evaluation
-        is_enabled=False if rank == 0 else False,
+        is_enabled=True if rank == 0 else False,
 
         sample_interval=1,
 

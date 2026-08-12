@@ -1,49 +1,50 @@
 """
 TrXLExtractor with proper Transformer-XL relative positional encoding,
-plus opt-in diagnostic capture (attention weights, hidden states, gate
-activations) used by trxl_memory_diagnostics.py.
+opt-in diagnostic capture (attention weights, hidden states, gate
+activations) used by trxl_memory_diagnostics.py, and three independent
+opt-out switches for the architectural extras layered on top of vanilla
+TrXL: gating, CNN spatial biasing, and hyperconnections.
 
-WHAT CHANGED vs the previous version:
-  - REMOVED: SinusoidalTemporalEncoding (was defined but never called in
-    forward() -- dead code). It used ABSOLUTE position, which is wrong
-    for a sliding memory buffer: a token's relative age changes every
-    step as it slides through the cache, so "stamping" it once when
-    written goes stale immediately.
-  - ADDED: RelativeSinusoidalEncoding + RelativeMultiHeadAttention,
-    implementing Transformer-XL's actual design (Dai et al. 2019):
-    position is injected directly into the attention SCORE computation
-    as a function of relative distance (query_pos - key_pos), computed
-    fresh every forward pass rather than stored in token content. Since
-    the query is always "now", relative distance to each memory slot
-    is always well-defined and never drifts -- this is what makes it
-    robust to sliding-window memory in a way absolute encoding isn't.
-  - nn.MultiheadAttention is gone from TrXLSplitBlock; replaced with
-    RelativeMultiHeadAttention, a small from-scratch implementation
-    (needed because relative position bias terms aren't expressible
-    with PyTorch's built-in multi-head attention).
+WHAT CHANGED vs the previous version (this pass):
+  - ADDED three constructor booleans on TrXLExtractor, all default True
+    so existing checkpoints/configs behave IDENTICALLY unless a caller
+    explicitly opts out:
+      * use_gating           -- GRU-style gate (GTrXL) vs plain residual
+      * use_spatial_bias     -- sigmoid(pos)-gated CNN features vs raw CNN
+      * use_hyperconnections -- learned multi-input mixing vs plain
+                                 pass-through residual stream
+    Each flag is threaded down to the module that actually implements the
+    behavior (GatingUnit, HyperConnection, and the CNN fusion step) rather
+    than being handled by conditionals scattered through forward(), so the
+    "disabled" path is a real structural fallback, not a no-op multiply.
+  - GatingUnit and HyperConnection now take an `enabled: bool` kwarg. When
+    disabled, they skip building their learnable parameters entirely
+    (no dead weights sitting unused in the state_dict) and their forward()
+    reduces to the mathematically standard substitute:
+      * GatingUnit(enabled=False)      -> x + sublayer_out   (plain residual)
+      * HyperConnection(enabled=False) -> sublayer_out        (plain pass-through)
+    Composed together (gating off + hyperconnections off), a block reduces
+    to a standard pre-norm Transformer-XL block: x = x + sublayer(norm(x)).
+  - GatingUnit.last_gate is now Optional and is explicitly set to None when
+    gating is disabled (rather than left stale from a previous call), so
+    diagnostic code can distinguish "no gate value because gating is off"
+    from "forward() hasn't run yet."
+  - use_spatial_bias=False skips constructing pos_to_cnn_bias altogether
+    (not just skipping its use), so no unused parameters are created.
 
-  - FIX (memory-bug pass): _update_memory previously built layer i's new
-    memory slice from self.memory[i - 1] (the layer BELOW's old memory)
-    instead of self.memory[i] (that layer's own old memory) for all
-    i > 0. This meant every layer above the first was caching a stale
-    copy of the layer-below's history rather than its own, corrupting
-    what the relative attention was actually attending over. Fixed to
-    index self.memory[i] uniformly, matching how _segment_hiddens was
-    already (correctly) indexed.
+  Everything else -- relative positional encoding, memory update/indexing,
+  NaN/Inf checks, diagnostic return shapes -- is unchanged from the
+  previous version.
 
 COMPATIBILITY:
+  - Drop-in, non-breaking: TrXLExtractor(...) with no new kwargs behaves
+    exactly as before (all three new flags default True).
   - Attention weight shape returned to diagnostics is unchanged:
-    (B, n_heads, 1, memory_len+1) per layer -- trxl_memory_diagnostics.py
-    needs NO changes.
-  - Checkpoint compatibility IS broken: the attention sublayer's
-    parameters are structurally different (separate content/position
-    key projections, learned u/v bias vectors, no more in_proj_weight/
-    out_proj from nn.MultiheadAttention). Old checkpoints will NOT
-    load into this version -- you'll need to retrain from scratch, or
-    write a manual state_dict remapping if you want to salvage anything
-    (the CNN/pos_mlp/fusion/gating/hyperconnection parameters are all
-    unaffected and would carry over fine; only the attention weights
-    themselves are incompatible).
+    (B, n_heads, 1, memory_len+1) per layer.
+  - Checkpoints trained with all three flags at their defaults load
+    exactly as before. Checkpoints trained with any flag set to False are
+    only loadable into an extractor constructed with that same flag value
+    (parameter set differs -- this is expected and intentional, not a bug).
 """
 
 import torch
@@ -56,17 +57,39 @@ from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
 
 
 class GatingUnit(nn.Module):
-    def __init__(self, d_model: int, gate_bias: float = 0.0):
+    """
+    GTrXL-style gated residual combination of x and a sublayer's output.
+
+    enabled=True  (default, original behavior):
+        g = sigmoid(Linear([x, sublayer_out]))
+        out = g * sublayer_out + (1 - g) * x
+    enabled=False:
+        out = x + sublayer_out   (standard Transformer residual connection)
+
+    When disabled, no gate parameters are created at all -- this isn't a
+    bypass flag on an otherwise-live module, it's a real fallback to the
+    vanilla residual that gating is meant to replace.
+    """
+    def __init__(self, d_model: int, gate_bias: float = 0.0, enabled: bool = True):
         super().__init__()
-        self.gate_linear = nn.Linear(d_model * 2, d_model)
-        nn.init.constant_(self.gate_linear.bias, gate_bias)
+        self.enabled = enabled
+        if self.enabled:
+            self.gate_linear = nn.Linear(d_model * 2, d_model)
+            nn.init.constant_(self.gate_linear.bias, gate_bias)
+        else:
+            self.gate_linear = None
         # Diagnostic-only: stores the most recent gate activation (detached,
         # no grad/memory cost beyond one tensor) so training code can inspect
         # "is this gate actually open" directly, without a separate forward
         # pass or hooks. Overwritten every forward call; read it right after.
+        # Explicitly None when gating is disabled -- there is no gate value.
         self.last_gate = None
 
     def forward(self, x: torch.Tensor, sublayer_out: torch.Tensor) -> torch.Tensor:
+        if not self.enabled:
+            self.last_gate = None
+            return x + sublayer_out
+
         combined = torch.cat([x, sublayer_out], dim=-1)
         g        = torch.sigmoid(self.gate_linear(combined))
         self.last_gate = g.detach()
@@ -74,15 +97,37 @@ class GatingUnit(nn.Module):
 
 
 class HyperConnection(nn.Module):
-    def __init__(self, n_layers: int, d_model: int, layer_idx: int):
+    """
+    Learned mixing of all prior hidden states plus the current sublayer
+    output (dynamic dense residual connections).
+
+    enabled=True (default, original behavior):
+        mixed = softmax(alpha, dim=0)-weighted sum of hidden_states
+        out   = mixed + beta * sublayer_out
+    enabled=False:
+        out = sublayer_out   (plain pass-through; hidden_states is ignored)
+
+    When disabled, no alpha/beta parameters are created. Combined with a
+    plain-residual GatingUnit, a block then behaves as a standard TrXL
+    block: x <- x + sublayer(norm(x)), with no cross-layer mixing.
+    """
+    def __init__(self, n_layers: int, d_model: int, layer_idx: int, enabled: bool = True):
         super().__init__()
+        self.enabled   = enabled
         self.layer_idx = layer_idx
         n_inputs       = layer_idx + 1
 
-        self.alpha = nn.Parameter(torch.zeros(n_inputs, d_model))
-        self.beta  = nn.Parameter(torch.ones(1, d_model))
+        if self.enabled:
+            self.alpha = nn.Parameter(torch.zeros(n_inputs, d_model))
+            self.beta  = nn.Parameter(torch.ones(1, d_model))
+        else:
+            self.alpha = None
+            self.beta  = None
 
     def forward(self, hidden_states: list, sublayer_out: torch.Tensor):
+        if not self.enabled:
+            return sublayer_out
+
         assert len(hidden_states) == self.alpha.shape[0], \
             f"Expected {self.alpha.shape[0]} hidden states, got {len(hidden_states)}"
 
@@ -203,7 +248,7 @@ class RelativeMultiHeadAttention(nn.Module):
 
 
 class TrXLSplitBlock(nn.Module):
-    def __init__(self, d_model, n_heads, d_ff, dropout=0.1, gate_bias=-2.0):
+    def __init__(self, d_model, n_heads, d_ff, dropout=0.1, gate_bias=-2.0, use_gating: bool = True):
         super().__init__()
         self.norm1 = nn.LayerNorm(d_model)
         self.norm2 = nn.LayerNorm(d_model)
@@ -214,8 +259,8 @@ class TrXLSplitBlock(nn.Module):
         self.act  = nn.ReLU()
         self.drop = nn.Dropout(dropout)
 
-        self.attn_gate = GatingUnit(d_model, gate_bias)
-        self.ff_gate   = GatingUnit(d_model, gate_bias)
+        self.attn_gate = GatingUnit(d_model, gate_bias, enabled=use_gating)
+        self.ff_gate   = GatingUnit(d_model, gate_bias, enabled=use_gating)
 
     def _check(self, tensor, name):
         if torch.isnan(tensor).any():
@@ -264,8 +309,35 @@ class TrXLExtractor(BaseFeaturesExtractor):
         d_ff_multiplier: int = 2,
         dropout: float = 0.1,
         gate_bias: float = -2.0,
-        cnn_only=False
+        cnn_only=False,
+        use_gating: bool = True,
+        use_spatial_bias: bool = True,
+        use_hyperconnections: bool = True,
     ):
+        """
+        use_gating:
+            True  (default) -- GTrXL gated residual combination (original
+                  behavior) for both the attention and feed-forward
+                  sublayers in every block.
+            False -- plain residual connections (x + sublayer_out) instead.
+                  No gate parameters are created.
+        use_spatial_bias:
+            True  (default) -- CNN features are modulated by
+                  sigmoid(Linear(pos)) before fusion (original behavior).
+            False -- raw CNN features are used unmodified; pos_to_cnn_bias
+                  is not constructed at all.
+        use_hyperconnections:
+            True  (default) -- each block's attn/ff output is combined with
+                  a learned softmax-weighted mix of ALL prior hidden states
+                  (original behavior).
+            False -- each block's attn/ff output passes straight through as
+                  the new hidden state (plain residual stream, no cross-
+                  layer mixing). No alpha/beta parameters are created.
+
+        All three flags default to True, so TrXLExtractor(...) with no new
+        kwargs is functionally and numerically identical to the previous
+        version of this class.
+        """
         super().__init__(observation_space, features_dim)
 
         self.memory_len       = memory_len
@@ -274,6 +346,10 @@ class TrXLExtractor(BaseFeaturesExtractor):
         self._d_model         = features_dim
         self.memory           = None
         self._segment_hiddens = None
+
+        self.use_gating           = use_gating
+        self.use_spatial_bias     = use_spatial_bias
+        self.use_hyperconnections = use_hyperconnections
 
         n_channels = observation_space["viewport"].shape[0]
         pos_dim    = observation_space["positions"].shape[0]
@@ -297,7 +373,13 @@ class TrXLExtractor(BaseFeaturesExtractor):
             nn.Linear(128,      64),                    nn.ReLU(),
         )
 
-        self.pos_to_cnn_bias = nn.Linear(pos_dim, cnn_out)
+        # Only constructed when spatial biasing is enabled -- disabling the
+        # flag removes these parameters entirely rather than just skipping
+        # their use in forward().
+        if self.use_spatial_bias:
+            self.pos_to_cnn_bias = nn.Linear(pos_dim, cnn_out)
+        else:
+            self.pos_to_cnn_bias = None
 
         self.fusion = nn.Sequential(
             nn.Linear(cnn_out + 64, self._d_model * 2),
@@ -309,28 +391,28 @@ class TrXLExtractor(BaseFeaturesExtractor):
         )
 
         # Spatial (world x,y) position encoding -- unrelated to the temporal
-        # fix below, this still gets added to the current token's content
-        # exactly as before.
+        # encoding below or to the use_spatial_bias flag above, this still
+        # gets added to the current token's content unconditionally, exactly
+        # as before.
         self.token_spatial_encoding = nn.Linear(pos_dim, self._d_model)
 
-        # Relative TEMPORAL positional encoding (replaces the old, unused
-        # SinusoidalTemporalEncoding). Fixed buffer, shared across layers --
-        # each block's RelativeMultiHeadAttention has its own k_pos_proj/u/v
-        # to interpret it independently.
+        # Relative TEMPORAL positional encoding. Fixed buffer, shared across
+        # layers -- each block's RelativeMultiHeadAttention has its own
+        # k_pos_proj/u/v to interpret it independently.
         self.rel_pos_encoding = RelativeSinusoidalEncoding(self._d_model, memory_len)
 
         d_ff = self._d_model * d_ff_multiplier
         self.blocks = nn.ModuleList([
-            TrXLSplitBlock(self._d_model, n_heads, d_ff, dropout, gate_bias)
+            TrXLSplitBlock(self._d_model, n_heads, d_ff, dropout, gate_bias, use_gating=use_gating)
             for _ in range(n_layers)
         ])
 
         self.hyper_connections_attn = nn.ModuleList([
-            HyperConnection(n_layers, self._d_model, layer_idx=i)
+            HyperConnection(n_layers, self._d_model, layer_idx=i, enabled=use_hyperconnections)
             for i in range(n_layers)
         ])
         self.hyper_connections_ff = nn.ModuleList([
-            HyperConnection(n_layers, self._d_model, layer_idx=i)
+            HyperConnection(n_layers, self._d_model, layer_idx=i, enabled=use_hyperconnections)
             for i in range(n_layers)
         ])
 
@@ -360,13 +442,8 @@ class TrXLExtractor(BaseFeaturesExtractor):
                     h[idx] = 0.0
 
     def _update_memory(self, new_hiddens):
-        # FIX: previously used `self.memory[i - 1] if i > 0 else self.memory[0]`,
-        # which for every layer i > 0 pulled the OLD memory of layer (i-1)
-        # instead of layer i's own old memory -- silently corrupting every
-        # layer above the first with a stale copy of the layer-below's
-        # history. Each layer's sliding window must be built from its own
-        # previous memory slice, matching how _segment_hiddens (below) was
-        # already (correctly) indexed by i for every layer.
+        # Each layer's sliding window is built from its own previous memory
+        # slice (self.memory[i]), matching how _segment_hiddens is indexed.
         new_memory = []
         for i in range(self.n_layers):
             updated = torch.cat([self.memory[i][:, 1:, :], new_hiddens[i].detach()], dim=1)
@@ -410,9 +487,10 @@ class TrXLExtractor(BaseFeaturesExtractor):
             if torch.isinf(tensor).any():
                 raise RuntimeError(f"Inf in TrXLExtractor at: {name}")
 
-        cnn_feat     = self.cnn(vp)
-        spatial_bias = self.pos_to_cnn_bias(pos)
-        cnn_feat     = cnn_feat * torch.sigmoid(spatial_bias)
+        cnn_feat = self.cnn(vp)
+        if self.use_spatial_bias:
+            spatial_bias = self.pos_to_cnn_bias(pos)
+            cnn_feat     = cnn_feat * torch.sigmoid(spatial_bias)
 
         pos_feat = self.pos_mlp(pos)
         current  = self.fusion(torch.cat([cnn_feat, pos_feat], dim=1))

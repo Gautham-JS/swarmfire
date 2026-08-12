@@ -120,6 +120,9 @@ class TrXLActorCritic(nn.Module):
             n_heads         = cfg.n_heads,
             d_ff_multiplier = cfg.d_ff_multiplier,
             dropout         = cfg.dropout,
+            use_gating      = cfg.is_gating,
+            use_hyperconnect= cfg.is_hyperconnect,
+            use_spatial_bias= cfg.is_spatial_bias
         )
 
         self.action_nvec = action_nvec
@@ -443,7 +446,7 @@ def train(cfg: EnvConfig, checkpoint_path=None):
         np.random.seed(cfg.seed)
         torch.manual_seed(cfg.seed)
 
-    device = torch.device("cuda:1" if torch.cuda.is_available() else "cpu")
+    device = cfg.device
     logging.info(f"[INIT] Device: {device} | N envs: {cfg.n_envs}")
 
     torch.backends.cudnn.benchmark        = True

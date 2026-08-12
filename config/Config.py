@@ -23,6 +23,8 @@ class AgentConfig:
 @dataclass
 class EnvConfig:
     run_id:           str   = "WIldfireRL"
+    run_name:         str   = "GTrXLH"
+    device:           str   = "cuda:1"
 
     # Environment
     world_size:       tuple = (512, 512)
@@ -40,6 +42,10 @@ class EnvConfig:
     n_heads:          int   = 4
     d_ff_multiplier:  int   = 2
     dropout:          float = 0.1
+    is_gating:        bool   = True
+    is_hyperconnect:  bool   = True
+    is_spatial_bias:  bool   = True
+
 
     # PPO
     total_timesteps:  int   = 4_000_000
