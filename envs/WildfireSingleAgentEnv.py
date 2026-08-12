@@ -1576,7 +1576,7 @@ class SingleAgentEnv(gym.Env):
         obs["viewport"] = self.create_global_crop_viewport_obs(state)
         obs["positions"] = self._build_positions_obs()
 
-        logging.info(f"[STEP] -> obs_positions = {obs['positions']}")
+        # logging.info(f"[STEP] -> obs_positions = {obs['positions']}")
 
         self._positions_history.append((state.pos_x, state.pos_y))
         self._reward_history.append(reward)
