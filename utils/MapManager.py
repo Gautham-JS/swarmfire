@@ -41,20 +41,19 @@ class Action:
 
 
 class BaseAgent:
-    def __init__(self, agent_id: str, world_size:tuple, start_pos:tuple = (0, 0), seed=None, is_eval_mode=False):
+    def __init__(self, agent_id: str, world_size:tuple, start_pos:tuple = (0, 0), seed=None, is_eval_mode=False, step_size=1):
         self._agent_id = agent_id
         self._world_size = world_size
         self._start_pos = start_pos
         self.seed = seed
         self._is_eval_mode = is_eval_mode
+        self.step_size = step_size
 
         self._state          : AgentState = AgentState()
         self._prev_state     : AgentState = None
 
         self._state.pos_x = start_pos[0]
         self._state.pos_y = start_pos[1]
-
-        self.step_size = 1
     
     def get_state(self):
         return self._state
@@ -102,8 +101,8 @@ class BaseAgent:
 
 
 class InProcessAgent(BaseAgent):
-    def __init__(self, agent_id, world_size, start_pos = (0, 0), seed=None, vp_size=64, is_eval_mode=False):
-        super().__init__(agent_id, world_size, start_pos, seed, is_eval_mode=is_eval_mode)
+    def __init__(self, agent_id, world_size, start_pos = (0, 0), seed=None, vp_size=64, is_eval_mode=False, step_size=1):
+        super().__init__(agent_id, world_size, start_pos, seed, is_eval_mode=is_eval_mode, step_size=step_size)
         self.map_manager: SimulatedMapManager = SimulatedMapManager(
             self._world_size,
             vp_size,
@@ -225,6 +224,10 @@ class InProcessAgent(BaseAgent):
             "viewport": self._get_obs_viewport_component(),
             "positions": self._get_obs_spatial_component()
         }
+
+    def close(self):
+        self.map_manager.close()
+        self.map_manager = None
 
 
 class UE5Agent(BaseAgent):
@@ -377,6 +380,10 @@ class UE5Agent(BaseAgent):
     def get_recency_map(self):
         return self.map_manager.get_recency_map()
 
+    def close(self):
+        self.map_manager.close()
+        self.map_manager = None
+
 
 """ 
 - Map Managers:
@@ -393,6 +400,12 @@ class MapManagerSingleton(type):
         if cls not in cls._instances:
             cls._instances[cls] = super().__call__(*args, **kwds) 
         return cls._instances[cls] 
+
+    def remove_instance(cls, target_class): # <--- Update to accept TWO arguments
+        # arg0 (cls) is the Metaclass (MapManagerSingleton)
+        # arg1 (target_class) is the class you want to delete (SimulatedMapManager)
+        if target_class in cls._instances:
+            del cls._instances[target_class]
 
 class BaseMapManager:
     def __init__(self, world_size, vp_size, seed=None, is_recency_enabled=True, is_eval_mode=False, randomized_scale=True):
@@ -414,6 +427,10 @@ class BaseMapManager:
         self._recency_decay = 0.9995   # per-step decay factor; tunable
         self._recency_visit_bump = 0.01   # value stamped on visit
         pass
+
+    def close(self):
+        type(self).remove_instance(type(self))
+
 
     def get_recency_map(self):
         return self._recency_map
@@ -528,7 +545,7 @@ class SimulatedMapManager(BaseMapManager, metaclass=MapManagerSingleton):
         if self._is_eval_mode:
             self._map, self._wind_vector = self._generator.create_eval_map(2, 0.001, 0.003, seed=self._seed)
         else:
-            self._map, self._wind_vector = self._generator.create_map(0.001, 0.003, seed=self._seed, selection_frac=0.9)
+            self._map, self._wind_vector = self._generator.create_map(0.001, 0.003, seed=self._seed, selection_frac=0.4)
 
     def extract_view_and_deltas_update(self, agent_state: AgentState):
         x, y = agent_state.pos_x, agent_state.pos_y
