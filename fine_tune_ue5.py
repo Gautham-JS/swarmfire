@@ -76,20 +76,18 @@ from gymnasium.wrappers import TimeLimit
 from stable_baselines3.common.vec_env import DummyVecEnv
 
 from envs.WildfireSingleAgentEnv import SingleAgentEnv
+from envs.RedisSingleAgentEnv import RedisRenderedEnv
 from config.Config import VideoWriterConfig, EnvConfig
 from comms.web_sockets.server import handle_client, WSCommsHandler, start_eval_server
 
-# --- Reuse from the original multi-env trainer -----------------------------
-# Rename this import to match wherever you saved that script. Everything
-# imported here must be byte-for-byte the same code the checkpoint was
-# trained with, or the architecture won't match load_state_dict.
+# reuse whatever I used from training harness for eval
 from train.trxl_train_single_agent import (
     TrXLActorCritic,
     TrXLRolloutBuffer,
     RunningMeanStd,
     vec_obs_to_tensor,
 )
-# -----------------------------------------------------------------------------
+
 
 import logging
 logging.basicConfig(
@@ -102,21 +100,21 @@ logging.basicConfig(
 # multi-env trainer's make_env_fn hardcoded is_recency_obs_disabled=True,
 # which feeds directly into observation_space shape.
 OBS_MUST_MATCH_TRAINING = dict(
-    is_recency_obs_disabled=True,
+    is_recency_obs_disabled=False,
 )
 
 
 def make_ue5_env_fn(cfg: EnvConfig, video_dir: str, device: torch.device, is_eval_mode: bool = False):
-    """Single UE5-backed env thunk — see module docstring, point 2."""
+    """Single UE5-backed env thunk - see module docstring, point 2."""
     video_config = VideoWriterConfig(
         is_enabled=True,
-        sample_interval=10,
-        save_interval=10,
+        sample_interval=1,
+        save_interval=1,
         base_path=video_dir,
     )
 
     def _init():
-        env = SingleAgentEnv(
+        env = RedisRenderedEnv(
             world_size=cfg.world_size,                 # MUST match original training
             render_mode="rgb_array",
             seed=cfg.seed,
@@ -129,6 +127,9 @@ def make_ue5_env_fn(cfg: EnvConfig, video_dir: str, device: torch.device, is_eva
             is_ue5_mode=True,
             is_eval_mode=is_eval_mode,
             device=device,
+            redis_host="localhost",
+            redis_port=8090,
+            redis_channel_prefix="ue5_train_env"
         )
         return TimeLimit(env, max_episode_steps=cfg.iter_limit)
 
@@ -183,13 +184,14 @@ def run_finetuning(checkpoint_path: str, cfg: EnvConfig, args: argparse.Namespac
         np.random.seed(cfg.seed)
         torch.manual_seed(cfg.seed)
 
-    sleep_time = 10
-    while sleep_time > 0:
+    r_count = 0
+    while not WSCommsHandler.instance().is_clients_connected():
         logging.info(
-            f"[INIT] Waiting {sleep_time} seconds for UE5 client to connect..."
+            f"[INIT] [WAIT] Waiting for UE5 client to connect, n_retries : {r_count}..."
         )
         time.sleep(1)
-        sleep_time -= 1
+        r_count+=1
+    logging.info("[INIT] [OK] : Client connection established.")
 
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
     logging.info(f"[INIT] Device: {device} | UE5 fine-tune (n_envs=1, forced)")
@@ -249,6 +251,8 @@ def run_finetuning(checkpoint_path: str, cfg: EnvConfig, args: argparse.Namespac
         f"lr={args.learning_rate}"
     )
     start_time = time.time()
+
+    logging.info(f"[FINETUNE] : Total Trainable Parameters : {len(trainable_params)}")
 
     while global_step < args.total_timesteps:
 

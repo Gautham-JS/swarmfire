@@ -3,6 +3,7 @@ from copy import copy
 
 import numpy as np
 import cv2
+import math
 
 from agents import Drone
 from utils import Viewpoint, Generators
@@ -545,7 +546,7 @@ class SimulatedMapManager(BaseMapManager, metaclass=MapManagerSingleton):
         if self._is_eval_mode:
             self._map, self._wind_vector = self._generator.create_eval_map(2, 0.001, 0.003, seed=self._seed)
         else:
-            self._map, self._wind_vector = self._generator.create_map(0.001, 0.003, seed=self._seed, selection_frac=0.4)
+            self._map, self._wind_vector = self._generator.create_map(0.001, 0.003, seed=self._seed, selection_frac=0.5)
 
     def extract_view_and_deltas_update(self, agent_state: AgentState):
         x, y = agent_state.pos_x, agent_state.pos_y
@@ -701,6 +702,22 @@ class UE5MapManager(BaseMapManager, metaclass=MapManagerSingleton):
         scale_y = self._world_size[1] / ue5_h
         return scale_x, scale_y
 
+    def _compute_capture_footprint_canonical(self, ue5_w, ue5_h, fov_deg=60.0, elevation=2800.0):
+        """
+        Ground footprint of a nadir (straight-down) camera capture, converted
+        into canonical world-cell units.
+        Assumes:
+        - Camera points straight down (no tilt)
+        - Render target capture is square, so horizontal FOV == vertical FOV
+            (per SceneCaptureComponent2D behavior: horizontal FOV is fixed,
+            vertical derives from the render target aspect ratio, which is 1
+            for a square capture)
+        - elevation is in the same UE units as world_size / scale computation
+        """
+        footprint_ue_units = 2.0 * elevation * math.tan(math.radians(fov_deg) / 2.0)
+        scale_x, _ = self.compute_scaling_fac((ue5_w, ue5_h))
+        return footprint_ue_units * scale_x
+
     def convert_ue5_to_cv_frame(self, x_ue5, y_ue5, vx_ue5, vy_ue5, ue5_w, ue5_h):
         """
         Converts a position + velocity from UE5's coordinate frame into the
@@ -738,6 +755,7 @@ class UE5MapManager(BaseMapManager, metaclass=MapManagerSingleton):
         ue5_w = float(response["w_shape_x"])
         ue5_h = float(response["w_shape_y"])
 
+        footprint_canonical = self._compute_capture_footprint_canonical(ue5_w, ue5_h)
         # Converts UE5's bottom-left-origin, y-up frame into the OpenCV-style
         # top-left-origin, y-down frame the rest of the stack expects, and
         # scales into canonical world_size units in the same step.
@@ -778,6 +796,34 @@ class UE5MapManager(BaseMapManager, metaclass=MapManagerSingleton):
 
         image_data = decode_observation_image(response)
         view_agent = self.compose_response_image_layers(image_data)
+
+        raw_px = view_agent.shape[0]  # assumes square raw capture
+        corrected_px = int(round(raw_px * (self._vp_size / footprint_canonical)))
+
+        if corrected_px <= raw_px:
+            # Raw capture covers MORE canonical cells than vp_size needs (camera
+            # footprint > vp_size) — center-crop down to just the corrected_px
+            # region that corresponds to exactly vp_size canonical cells.
+            offset = (raw_px - corrected_px) // 2
+            view_agent = view_agent[offset:offset + corrected_px, offset:offset + corrected_px, :]
+        else:
+            # Raw capture covers FEWER canonical cells than vp_size needs
+            # (footprint_canonical < vp_size) — pad with zeros so the result still
+            # represents exactly vp_size canonical cells, with the physically
+            # uncaptured border reported as empty (no fuel/fire data).
+            pad = corrected_px - raw_px
+            pad_before = pad // 2
+            pad_after = pad - pad_before
+            view_agent = np.pad(
+                view_agent,
+                ((pad_before, pad_after), (pad_before, pad_after), (0, 0)),
+                mode="constant", constant_values=0.0
+            )
+
+        # ONLY remaining resize: corrected_px (== exactly vp_size canonical cells,
+        # at whatever raw pixel density) -> vp_size pixels. This changes pixel
+        # count only, not the represented footprint, since the crop/pad above
+        # already fixed that.
         state.vp_image = cv2.resize(view_agent, (state.vp_size, state.vp_size), interpolation=cv2.INTER_NEAREST)
         state.recency_image = self.get_recency_view(state.pos_x, state.pos_y)
         state.revisit_ts_map = self.get_revisit_timestep_view(state.pos_x, state.pos_y)
@@ -802,17 +848,57 @@ class UE5MapManager(BaseMapManager, metaclass=MapManagerSingleton):
         self.last_response = response
         return response
 
+    def fast_min_max_inplace(self, arr: np.ndarray) -> None:
+        """
+        Normalizes the array in-place to save memory and improve speed.
+        Modifies 'arr' directly.
+        """
+        a_min = arr.min()
+        a_max = arr.max()
+        diff = a_max - a_min
+
+        if diff == 0:
+            arr.fill(0)
+            return
+
+        # Step 1: Subtract min from every element (in-place)
+        arr -= a_min
+
+        # Step 2: Divide by the range (in-place)
+        arr /= diff
+
     def compose_response_image_layers(self, decoded_image):
+        """
+        Empirically determined via 90°-rotation testing: the raw UE5 camera
+        framebuffer is related to our world-array convention (axis0=pos_x,
+        axis1=pos_y) by a full 180° rotation — i.e. BOTH raw axes need to be
+        reversed, and no transpose/axis-swap is needed at all. (A transpose
+        would only be required if the raw image's row/col axes were swapped
+        relative to world x/y; the fact that a pure 90°+90°=180° rotation
+        resolves it confirms axis0/axis1 already correspond correctly to
+        pos_x/pos_y — they're just both reversed.)
+        """
         w = 0.7
         high_risk_fuels   = decoded_image[:, :, 2] # B
         low_risk_fuels    = decoded_image[:, :, 1] # G
         fires             = decoded_image[:, :, 0] # R
 
+        # 180° rotation = flip both axes, no transpose
+        high_risk_fuels = high_risk_fuels[::-1, ::-1]
+        low_risk_fuels  = low_risk_fuels[::-1, ::-1]
+        fires           = fires[::-1, ::-1]
+
         alive = low_risk_fuels.astype(np.float32) / 255.0
         dead  = high_risk_fuels.astype(np.float32) / 255.0
 
+        fires = fires.astype(np.float32) / 255.0
+        if fires.max() < 0.05:
+            fires = np.zeros_like(fires, dtype=np.float32)
+        else:
+            self.fast_min_max_inplace(fires)
+            
         fuel = w * alive + (1.0 - w) * dead
-        return np.stack([fuel, fires.astype(np.float32) / 255.0], axis=-1)  # (H, W, 2)
+        return np.stack([fuel, fires], axis=-1)  # (H, W, 2)
 
 
     def get_map_observation(self, state:AgentState):

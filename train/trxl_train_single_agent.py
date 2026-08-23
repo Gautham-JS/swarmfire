@@ -53,6 +53,7 @@ from gymnasium.wrappers import TimeLimit
 from stable_baselines3.common.vec_env import SubprocVecEnv
 # from envs.IsolatedAgent import IsolatedAgentEnv // INOP for refactors
 from envs.WildfireSingleAgentEnv import SingleAgentEnv
+from envs.RedisSingleAgentEnv import RedisRenderedEnv
 from config.Config import VideoWriterConfig, EnvConfig
 from policies.TrXL import TrXLExtractor
 
@@ -376,7 +377,7 @@ def make_env_fn(cfg: EnvConfig, rank: int, is_eval: bool = False):
     )
 
     def _init():
-        env = SingleAgentEnv(
+        env = RedisRenderedEnv(
             world_size      = cfg.world_size,
             render_mode     = "rgb_array" if rank == 0 else "rgb_array",
             seed            = cfg.seed + rank if cfg.seed is not None else None,   # different seed per env
@@ -385,8 +386,11 @@ def make_env_fn(cfg: EnvConfig, rank: int, is_eval: bool = False):
             env_id          = cfg.run_id,
             vp_size         = cfg.vp_size,
             is_gt_visible   = True,
-            is_recency_obs_disabled=True,
-            device          = torch.device("cuda:1")
+            is_recency_obs_disabled=False,
+            device          = torch.device("cuda:0"),
+            redis_host="localhost",
+            redis_port=8090,
+            redis_channel_prefix=f"curr_run",
         )
         return TimeLimit(env, max_episode_steps=cfg.iter_limit)
     return _init

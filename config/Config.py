@@ -34,6 +34,7 @@ class EnvConfig:
     n_envs:           int   = 16          # parallel environments
     vp_size:          int   = 64          # viewport size
     disable_recency_obs: bool = False      # disable recency observation channel
+    velocity_step_size: float = 1.0         # step size for velocity changes in the environment
 
     # TrXL
     features_dim:     int   = 256
@@ -69,8 +70,11 @@ class EnvConfig:
         "fire_discovery":       1.6,
         "fire_tracking":        0.5,
         "risk":                 1.5,
-        "recency_pen":          2,
+        "recency_penalty":      15.0,
     })
+    map_type_sel_frac: float = 0.4
+    wsize_min:          int   = 128
+    wsize_max:          int   = 1028
 
     # Checkpointing
     checkpoint_freq:  int   = 50_000

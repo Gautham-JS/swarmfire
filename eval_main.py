@@ -36,7 +36,7 @@ if __name__ == "__main__":
     # Replace this with however your project constructs EnvConfig.
     # =========================================================================
     cfg = EnvConfig()
-
+    
     run_evaluation(
         checkpoint_path=args.checkpoint,
         cfg=cfg,

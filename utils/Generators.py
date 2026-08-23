@@ -78,7 +78,7 @@ from skimage.morphology import dilation, disk, erosion # Added erosion for consi
 
 
 class FuelMapGenerator:
-    def __init__(self, size, randomize_scales=True, size_range=(256, 2048)):
+    def __init__(self, size, randomize_scales=True, size_range=(256, 756)):
         self.size = size
         self._is_randomize_scales = randomize_scales
         self._size_range = size_range

@@ -15,6 +15,7 @@ import asyncio
 from gymnasium.wrappers import TimeLimit
 
 from envs.WildfireSingleAgentEnv import SingleAgentEnv
+from envs.RedisSingleAgentEnv import RedisRenderedEnv
 from config.Config import VideoWriterConfig, EnvConfig
 from policies.TrXL import TrXLExtractor
 from comms.web_sockets.server import start_eval_server
@@ -241,7 +242,7 @@ def make_eval_env(
         base_path="./eval_videos/"
     )
 
-    env = SingleAgentEnv(
+    env = RedisRenderedEnv(
 
         world_size=cfg.world_size,
 
@@ -259,7 +260,10 @@ def make_eval_env(
 
         is_ue5_mode= True,
 
-        is_recency_obs_disabled= True,
+        is_recency_obs_disabled=False,
+        redis_host="localhost",
+        redis_port=8090,
+        redis_channel_prefix="ue5_run",
 
         device=torch.device(
             "cuda:0"
@@ -834,7 +838,6 @@ def run_evaluation(
     env = make_eval_env(
         cfg
     )
-
     # =========================================================================
     # Agent
     # =========================================================================
@@ -846,11 +849,8 @@ def run_evaluation(
     )
 
     agent = TrXLActorCritic(
-
         observation_space=obs_space,
-
         action_nvec=action_nvec,
-
         cfg=cfg
     ).to(device)
 
