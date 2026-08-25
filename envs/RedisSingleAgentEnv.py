@@ -106,8 +106,6 @@ class RedisRenderedEnv(SingleAgentEnv):
             else np.zeros((self._n_obs_channels, 84, 84), dtype=np.float32)
         )
 
-        latest_obs_chw[0, :, :] = np.zeros((84, 84), dtype=np.float32)
-
         global_recency_map = self.agent_instance.get_recency_map()
 
         self._render_pub.publish_frame(

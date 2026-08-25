@@ -259,7 +259,7 @@ def make_eval_env(
         video_conf              = video_config,
         phase_weights           = cfg.phase_weights,
         env_id                  = f"{cfg.run_id}_{cfg.world_size[0]}",
-        is_gt_visible           = False,
+        is_gt_visible           = True,
         is_recency_obs_disabled = False,
         redis_host               = "localhost",
         redis_port               = 8090,
