@@ -19,7 +19,9 @@ This model is defined in `policies/TrXL.py`. This name needs update though as it
 <!-- ARCHITECTURAL DIAGRAM PLACEHOLDER -->
 <!-- [Insert Architecture Diagram Here] -->
 
-![Screenshot of a comment on a GitHub issue showing an image, added in the Markdown, of an Octocat smiling and raising a tentacle.](policies/HC_Updated.drawio (2).png)
+![Hyper Connentions used in Mixing Sublayer Parameters as proposed in the paper.](policies/HC_Updated.drawio%20%282%29.png)
+
+![Hyper Connentions used in Mixing Inter-Layer Contributions to re-distribute effort to aid in representational collapse as done in this project.](policies/HC_Layout.drawio%20%283%29.png)
 
 ## Practical Application: Sim-to-World Transfer
 
