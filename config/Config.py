@@ -87,5 +87,5 @@ class EnvConfig:
 
     # WandB
     wandb_project:    str   = "thesis-drl-trxl"
-    wandb_api_key:    str   = "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"
+    wandb_api_key:    str   = None
 
