@@ -1,2 +1,38 @@
-# swarmfire
-Research on UAV swarm for wildfire management.
+# Swarmfire: Gated Transformer XL Architecture
+
+Welcome to the repo for Swarmfire. This project implements a specialized reinforcement learning agent designed for partially observable environments using a highly modified GTrXL (Gated Transformer XL) architecture.
+
+## The Model: GTrXL with Hyperconnections
+
+The core of our agent is built on a custom transformer backbone that focuses on maintaining long-term dependencies without the usual representational collapse seen in deep Transformers. We've implemented several key architectural features to ensure the model can effectively utilize its memory over long rollout horizons.
+
+### Key Architectural Features
+
+* **Gated Residual Connections**: Instead of standard residual connections, we use a learned gating mechanism. This allows the model to dynamically decide how much new information from the sublayer should be integrated into the existing hidden state, helping to stabilize training in partially observable settings.
+* **Hyperconnections (Cross-Layer Mixing)**: To prevent the network from becoming too deep and losing signal, we've implemented hyperconnections. This feature allows each layer to perform a learned, softmax-weighted sum of all prior hidden states plus its own sublayer output. It basically creates dynamic, dense residual connections across the entire depth of the network.
+* **Depth Blending**: By combining gating and hyperconnections, the model can effectively "blend" features across different depths, making it much more robust to the vanishing gradient problems that often plague deep recurrent/transformer models.
+* **Relative Positional Encoding**: We use a fixed, sinusoidal relative positional encoding. Because it's based on relative distance rather than absolute time, the model doesn't experience any drift as tokens age through the sliding window memory buffer.
+
+<!-- ARCHITECTURAL DIAGRAM PLACEHOLDER -->
+<!-- [Insert Architecture Diagram Here] -->
+
+## Practical Application: Sim-to-World Transfer
+
+One of our primary goals is making it as easy as possible to move an agent from simulation to a real-world or high-fidelity environment. We've built the transport and interface layers to be extremely flexible.
+
+### Decoupled Interface Design
+
+The agent doesn't care where its observations come from or where its actions go, as long as they follow the required interface. This abstraction allows for clean separation of concerns:
+
+* **Communication Layers**: Currently, we use a WebSocket server (`comms/web_sockets/server.py`) to facilitate communication between different parts of the system.
+* **Data Pipeline**: Our environment implementation (`envs/RedisSingleAgentEnv.py`) uses a Redis client to publish environmental data to a message queue. This allows multiple observers or rendering processes to subscribe to the same stream without slowing down the training loop.
+* **Extensibility**: The interface is designed so that an agent can simply implement the required methods to interface with new systems, such as ROS2, for robot deployment.
+
+### Unreal Engine 5 Integration
+
+We are currently demonstrating this setup by running an agent abstraction inside a high-fidelity Unreal Engine 5 simulation. In this workflow:
+1. The **UE5 Simulation** computes the physics and visual data.
+2. Data is published via **WebSockets** and/or **Redis**.
+3. The **RL Agent** consumes these observations, computes actions, and sends them back through the same pipeline.
+
+This setup provides a seamless bridge between the high-level reasoning of the GTrXL model and the complex, low-level physics of advanced simulators, paving the way for robust sim-to-world transfer.

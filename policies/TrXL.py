@@ -1,50 +1,5 @@
 """
-TrXLExtractor with proper Transformer-XL relative positional encoding,
-opt-in diagnostic capture (attention weights, hidden states, gate
-activations) used by trxl_memory_diagnostics.py, and three independent
-opt-out switches for the architectural extras layered on top of vanilla
-TrXL: gating, CNN spatial biasing, and hyperconnections.
-
-WHAT CHANGED vs the previous version (this pass):
-  - ADDED three constructor booleans on TrXLExtractor, all default True
-    so existing checkpoints/configs behave IDENTICALLY unless a caller
-    explicitly opts out:
-      * use_gating           -- GRU-style gate (GTrXL) vs plain residual
-      * use_spatial_bias     -- sigmoid(pos)-gated CNN features vs raw CNN
-      * use_hyperconnections -- learned multi-input mixing vs plain
-                                 pass-through residual stream
-    Each flag is threaded down to the module that actually implements the
-    behavior (GatingUnit, HyperConnection, and the CNN fusion step) rather
-    than being handled by conditionals scattered through forward(), so the
-    "disabled" path is a real structural fallback, not a no-op multiply.
-  - GatingUnit and HyperConnection now take an `enabled: bool` kwarg. When
-    disabled, they skip building their learnable parameters entirely
-    (no dead weights sitting unused in the state_dict) and their forward()
-    reduces to the mathematically standard substitute:
-      * GatingUnit(enabled=False)      -> x + sublayer_out   (plain residual)
-      * HyperConnection(enabled=False) -> sublayer_out        (plain pass-through)
-    Composed together (gating off + hyperconnections off), a block reduces
-    to a standard pre-norm Transformer-XL block: x = x + sublayer(norm(x)).
-  - GatingUnit.last_gate is now Optional and is explicitly set to None when
-    gating is disabled (rather than left stale from a previous call), so
-    diagnostic code can distinguish "no gate value because gating is off"
-    from "forward() hasn't run yet."
-  - use_spatial_bias=False skips constructing pos_to_cnn_bias altogether
-    (not just skipping its use), so no unused parameters are created.
-
-  Everything else -- relative positional encoding, memory update/indexing,
-  NaN/Inf checks, diagnostic return shapes -- is unchanged from the
-  previous version.
-
-COMPATIBILITY:
-  - Drop-in, non-breaking: TrXLExtractor(...) with no new kwargs behaves
-    exactly as before (all three new flags default True).
-  - Attention weight shape returned to diagnostics is unchanged:
-    (B, n_heads, 1, memory_len+1) per layer.
-  - Checkpoints trained with all three flags at their defaults load
-    exactly as before. Checkpoints trained with any flag set to False are
-    only loadable into an extractor constructed with that same flag value
-    (parameter set differs -- this is expected and intentional, not a bug).
+Gated Transformer XL Hyperconnected Architecture, basically the final version for the MTP.
 """
 
 import torch
